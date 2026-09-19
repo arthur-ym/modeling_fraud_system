@@ -1,0 +1,30 @@
+[project]
+name = "modeling-fraud-system"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "imbalanced-learn>=0.14.2",
+    "ipykernel>=7.3.0",
+    "jupyter>=1.1.1",
+    "lightgbm>=4.7.0",
+    "matplotlib>=3.11.2",
+    "mlflow>=3.16.1",
+    "numpy>=2.5.3",
+    "pandas>=3.0.6",
+    "plotly>=7.1.0",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
+    "seaborn>=0.13.2",
+    "shap>=0.52.0",
+    "sweetviz>=2.3.3",
+    "xgboost>=3.4.1",
+]
+
+[project.scripts]
+modeling-fraud-system = "modeling_fraud_system:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
