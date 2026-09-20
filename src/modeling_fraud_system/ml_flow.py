@@ -1,12 +1,50 @@
-# from modelling.rp_de_solvency_newcustomers_4_0_0.utils.configs import BaseConfigParams
+import logging
 import os
-import pandas as pd
+from typing import Optional
+
 import mlflow
 import mlflow.pyfunc
 import mlflow.pytorch
 import mlflow.sklearn
+import pandas as pd
 from pandas import DataFrame
+
 from modeling_fraud_system.run_time_configuration import BaseConfigParams
+
+log = logging.getLogger(__name__)
+
+
+def _require_active_run() -> None:
+    if mlflow.active_run() is None:
+        raise RuntimeError(
+            "No active MLflow run found. Start a run before logging."
+        )
+
+
+def start_mlflow_run(
+    run_name: Optional[str] = None,
+    experiment_name: Optional[str] = None,
+    run_id: Optional[str] = None,
+    tags: Optional[dict] = None,
+):
+    """Start or resume an MLflow run. Use as a context manager.
+
+    Does not set a tracking URI; configure that via env (`MLFLOW_TRACKING_URI`)
+    or `mlflow.set_tracking_uri` before calling.
+    """
+    if experiment_name:
+        mlflow.set_experiment(experiment_name)
+        log.info("Set MLflow experiment to: %s", experiment_name)
+
+    start_kwargs: dict = {}
+    if run_id:
+        start_kwargs["run_id"] = run_id
+    else:
+        if run_name:
+            start_kwargs["run_name"] = run_name
+        if tags:
+            start_kwargs["tags"] = tags
+    return mlflow.start_run(**start_kwargs)
 
 
 def get_mlflow_run(base_config_params: BaseConfigParams) -> str:
@@ -246,35 +284,37 @@ def log_artifacts_to_mlflow(
         raise ValueError(f"Not able to log the artifact {name} to MLflow, error: {e}")
 
 
-def log_params_to_mlflow(params: dict, base_config_params: BaseConfigParams) -> None:
-    """Log parameters to MLflow.
-
-    Args:
-        params (dict): The parameters to log.
-        base_config_params (BaseConfigParams): The base configuration parameters.
-    Returns:
-
-
-    Example:
-        base_config_params = BaseConfigParams(mlflow_run_id="your_mlflow_run_id")
-        params = {
-            "learning_rate": 0.01,
-            "batch_size": 32,
-            "num_epochs": 10,
-            "type": "classification",
-        }
-        log_params_to_mlflow(params, base_config_params)
-    """
-
-    if mlflow.active_run() is None:
-        raise Exception(
-            "No active MLflow run found. Please start an MLflow run before calling this function."
-        )
+def log_params_to_mlflow(
+    params: dict, base_config_params: Optional[BaseConfigParams] = None
+) -> None:
+    """Log a dictionary of parameters to the active MLflow run."""
+    del base_config_params
+    _require_active_run()
     try:
-        for key, value in params.items():
-            mlflow.log_param(key, value)
+        mlflow.log_params(params)
     except Exception as e:
-        raise ValueError(f"Not able to log the parameters to MLflow, error: {e}")
+        raise ValueError(f"Not able to log the parameters to MLflow, error: {e}") from e
+
+
+def log_metrics_to_mlflow(metrics: dict, step: Optional[int] = None) -> None:
+    """Log a dictionary of metrics to the active MLflow run."""
+    _require_active_run()
+    try:
+        mlflow.log_metrics(metrics, step=step)
+    except Exception as e:
+        raise ValueError(f"Not able to log the metrics to MLflow, error: {e}") from e
+
+
+def log_figures_to_mlflow(figures: dict, artifact_path: str = "plots") -> None:
+    """Log matplotlib figures to the active MLflow run as PNG artifacts."""
+    _require_active_run()
+    try:
+        for name, figure in figures.items():
+            if figure is None:
+                continue
+            mlflow.log_figure(figure, f"{artifact_path}/{name}.png")
+    except Exception as e:
+        raise ValueError(f"Not able to log figures to MLflow, error: {e}") from e
 
 
 def save_model_into_mlflow(

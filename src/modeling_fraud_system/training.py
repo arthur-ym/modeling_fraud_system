@@ -808,7 +808,8 @@ class ModelTrainingWorkflow():
         figures: dict,
     ):
         from modeling_fraud_system.ml_flow import (
-            log_artifacts_to_mlflow,
+            log_figures_to_mlflow,
+            log_metrics_to_mlflow,
             log_params_to_mlflow,
             save_model_into_mlflow,
         )
@@ -835,7 +836,7 @@ class ModelTrainingWorkflow():
         if "cat_features" in model_params and model_params["cat_features"] is not None:
             params["cat_features"] = ",".join(map(str, model_params["cat_features"]))
 
-        log_params_to_mlflow(params, self.run_time_config)
+        log_params_to_mlflow(params)
 
         metric_keys = [
             "accuracy",
@@ -860,15 +861,10 @@ class ModelTrainingWorkflow():
         if contrafactual is not None:
             for key in metric_keys:
                 metrics[f"test_contrafactual_{key}"] = contrafactual["metrics"][key]
-            log_params_to_mlflow(
-                {"test_contrafactual_size": contrafactual["size"]},
-                self.run_time_config,
-            )
+            log_params_to_mlflow({"test_contrafactual_size": contrafactual["size"]})
 
-        mlflow.log_metrics(metrics)
-
-        for name, figure in figures.items():
-            log_artifacts_to_mlflow(figure, format="plt", name=name, path="plots")
+        log_metrics_to_mlflow(metrics)
+        log_figures_to_mlflow(figures, artifact_path="plots")
 
         signature = infer_signature(x_train, self.model.predict_proba(x_train))
         save_model_into_mlflow(self.model, flavor=model_type, signature=signature)
@@ -966,19 +962,17 @@ class ModelTrainingWorkflow():
         self.test_metrics = test_metrics
 
         if log_into_mlflow:
-            experiment_name = self.run_time_config.experiment_name
-            mlflow.set_experiment(experiment_name)
-            log.info(f"Set MLflow experiment to: {experiment_name}")
-            start_kwargs = {}
-            if self.run_time_config.mlflow_run_id:
-                start_kwargs["run_id"] = self.run_time_config.mlflow_run_id
-            else:
-                start_kwargs["run_name"] = (
+            from modeling_fraud_system.ml_flow import start_mlflow_run
+
+            with start_mlflow_run(
+                experiment_name=self.run_time_config.experiment_name,
+                run_id=self.run_time_config.mlflow_run_id,
+                run_name=(
                     run_name
                     or self.run_time_config.mlflow_run_name
                     or f"train_{model_type}"
-                )
-            with mlflow.start_run(**start_kwargs) as active_run:
+                ),
+            ) as active_run:
                 self.run_time_config.mlflow_run_id = active_run.info.run_id
                 log.info(
                     f"Logging training results to MLflow run {active_run.info.run_id}."
