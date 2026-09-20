@@ -219,3 +219,5 @@ __marimo__/
 
 # Local notes (not for the repo)
 docker-commands.md
+data/
+reports/

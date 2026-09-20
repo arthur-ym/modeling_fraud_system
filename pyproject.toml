@@ -8,6 +8,7 @@ dependencies = [
     "imbalanced-learn>=0.14.2",
     "ipykernel>=7.3.0",
     "jupyter>=1.1.1",
+    "kagglehub>=1.0.2",
     "lightgbm>=4.7.0",
     "matplotlib>=3.11.2",
     "mlflow>=3.16.1",
