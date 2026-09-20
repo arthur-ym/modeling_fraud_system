@@ -1,4 +1,4 @@
-"""Workflow class for training a solvency prediction model using XGBoost or CatBoost."""
+"""Workflow class for training a fraud prediction model using XGBoost or CatBoost."""
 
 # Standard library imports
 import logging
@@ -46,52 +46,36 @@ log.setLevel(logging.INFO)
 
 # pylint: disable=too-many-instance-attributes
 class ModelTrainingWorkflow():
-    """Workflow class for training solvency prediction models on new customer data.
+    """Workflow class for training fraud prediction models.
 
-    This workflow handles the complete machine learning pipeline for solvency prediction:
-    - Data loading and feature engineering
-    - Train/validation/test splitting with temporal and random strategies
-    - Data preprocessing and balancing
-    - Model training with hyperparameter tuning or fixed parameters
-    - Comprehensive model evaluation and visualization
-    - MLflow experiment tracking and model persistence
-
-    Supports both XGBoost and CatBoost classifiers with extensive evaluation metrics
-    including AUC, PR-AUC, KS statistic, calibration analysis, and SHAP explanations.
+    This workflow handles the machine learning pipeline for fraud prediction:
+    - Loading tabular data from parquet
+    - Train/validation/test splitting with a temporal test window and a random
+      stratified split of the training period
+    - Optional class balancing on the training set
+    - Feature selection and numeric filtering
+    - Model training with XGBoost or CatBoost using fixed hyperparameters
+    - Evaluation (AUC, PR-AUC, KS, calibration) and optional MLflow logging
     """
 
     def __init__(self, base_config_params: BaseConfigParams):
-        """Initialize the workflow with the provided configuration.
+        """Initialize the workflow with runtime configuration.
 
         Parameters
         ----------
-        config : dict
-            Configuration dictionary containing model training parameters including:
-            - Model hyperparameters (learning_rate, max_depth, etc.)
-            - MLflow experiment settings
-            - Data balancing options
-            - Evaluation thresholds
-        BaseConfigParams : BaseConfigParams
-            Runtime configuration parameters including:
-            - training_start_date: Start date for training data
-            - training_end_date: End date for training data
-            - test_start_date: Start date for test data
-            - test_end_date: End date for test data
+        base_config_params : BaseConfigParams
+            Runtime configuration, including training/test date ranges and MLflow
+            experiment settings (experiment_name, mlflow_run_id, mlflow_run_name).
 
         Examples
         --------
-        >>> config = {
-        ...     'model_seed': 42,
-        ...     'max_evals': 50,
-        ...     'mlflow_experiment_path': '/experiments/solvency'
-        ... }
         >>> runtime_params = BaseConfigParams(
         ...     training_start_date='2023-01-01',
         ...     training_end_date='2023-06-30',
         ...     test_start_date='2023-07-01',
         ...     test_end_date='2023-09-30'
         ... )
-        >>> workflow = SolvencyNewCustomersModelTraining(config, runtime_params)
+        >>> workflow = ModelTrainingWorkflow(runtime_params)
         """
         super().__init__()
         self.run_time_config = base_config_params
@@ -125,11 +109,24 @@ class ModelTrainingWorkflow():
         columns: list = [],
 
     ):
-        """Load base data from external  source and generate features.
+        """Load a parquet dataset into ``self.data_set``.
 
-        self.data_set = pandas_df
+        Parameters
+        ----------
+        path_external_data : str
+            Path to a parquet file readable by pyarrow.
+        sample : bool or float, default=False
+            If a positive float, subsample that fraction of rows (``frac=sample``)
+            with ``random_state=42``. If False, load the full file.
+        columns : list, default=[]
+            Column names passed to ``pandas.read_parquet``. An empty list is
+            forwarded as-is (pandas uses ``None`` for all columns).
 
-        log.info("Data loading completed successfully.")"""
+        Returns
+        -------
+        None
+            Sets ``self.data_set`` to the loaded (and optionally sampled) DataFrame.
+        """
 
         #load parquet file
         self.data_set = pd.read_parquet(path_external_data, engine="pyarrow",columns=columns)
@@ -377,7 +374,9 @@ class ModelTrainingWorkflow():
         Returns
         -------
         None
-            Updates self.df_train, self.x_train, and self.y_train in place.
+            Updates ``self.df_train`` and ``self.y_train`` in place. Sets
+            ``self.x_train`` to the full balanced DataFrame (including the
+            target column). Validation and test frames are not modified.
 
         Examples
         --------
@@ -559,29 +558,29 @@ class ModelTrainingWorkflow():
         log.info("Preprocessed data generation completed successfully.")
 
     def build_pipeline(self):
-        """Apply preprocessing pipeline to training, test, and validation data.
+        """Apply a fitted preprocessing pipeline to train, test, and validation features.
 
-        Applies a pre-loaded scikit-learn pipeline to transform the feature sets.
-        The pipeline should be loaded before calling this method.
+        Requires ``self.pipeline`` to be a fitted transformer, and ``self.x_train``,
+        ``self.x_test``, and ``self.x_val`` to already be set.
 
         Returns
         -------
         None
-            Sets self.x_train_preproc, self.x_test_preproc, self.x_val_preproc.
+            Sets ``self.x_train_preproc``, ``self.x_test_preproc``, and
+            ``self.x_val_preproc``.
 
         Raises
         ------
         AttributeError
-            If self.pipeline is None or not set.
+            If ``self.pipeline`` is None or not set.
 
         Notes
         -----
-        This method assumes that the pipeline has already been fitted on training data
-        or is a fitted pipeline loaded from disk.
+        This method assumes the pipeline is already fitted (or loaded from disk).
+        It does not fit the pipeline.
 
         Examples
         --------
-        >>> # Load or create pipeline first
         >>> workflow.pipeline = some_fitted_pipeline
         >>> workflow.build_pipeline()
         """
@@ -599,6 +598,29 @@ class ModelTrainingWorkflow():
         categorical_features: list | None,
         seed: int,
     ):
+        """Build an unfitted XGBoost or CatBoost classifier.
+
+        Default hyperparameters are applied first, then overridden by ``hyperparameters``.
+        For CatBoost, ``categorical_features`` is stored as ``cat_features`` when given.
+
+        Parameters
+        ----------
+        model_type : str
+            ``"xgboost"`` or any other value (treated as CatBoost).
+        hyperparameters : dict or None
+            Extra constructor kwargs. Keys ``tree_method`` and ``objective`` are
+            popped for XGBoost before merging remaining overrides.
+        categorical_features : list or None
+            CatBoost categorical feature names or indices. Ignored for XGBoost.
+        seed : int
+            Random seed (``seed`` for XGBoost, ``random_seed`` for CatBoost).
+
+        Returns
+        -------
+        tuple
+            ``(model, model_params)`` where ``model`` is the unfitted classifier
+            and ``model_params`` is the dict passed to its constructor.
+        """
         hyperparameters = dict(hyperparameters or {})
         if model_type == "xgboost":
             tree_method = hyperparameters.pop("tree_method", "hist")
@@ -638,6 +660,15 @@ class ModelTrainingWorkflow():
         return model, model_params
 
     def _frames_for_training(self):
+        """Copy preprocessed frames and drop ``contrafactual_flag`` if present.
+
+        Returns
+        -------
+        tuple
+            ``(x_train, x_validation, x_test, dropped)`` where the first three
+            are copies of the preprocessed feature frames and ``dropped`` is True
+            if ``contrafactual_flag`` was removed from all three.
+        """
         x_train = self.x_train_preproc.copy()
         x_validation = self.x_validation_preproc.copy()
         x_test = self.x_test_preproc.copy()
@@ -659,6 +690,29 @@ class ModelTrainingWorkflow():
         categorical_features: list | None,
         verbose: bool,
     ):
+        """Fit ``self.model`` on training data with a validation eval set.
+
+        XGBoost uses ``eval_set`` on the raw frames. CatBoost wraps frames in
+        ``Pool`` objects so categorical columns can be passed through.
+
+        Parameters
+        ----------
+        model_type : str
+            ``"xgboost"`` or CatBoost (any other value).
+        x_train : pd.DataFrame
+            Training features (without ``contrafactual_flag`` if it was dropped).
+        x_validation : pd.DataFrame
+            Validation features used as the eval set.
+        categorical_features : list or None
+            CatBoost categorical feature names or indices. Ignored for XGBoost.
+        verbose : bool
+            Forwarded to the estimator's ``fit`` method.
+
+        Returns
+        -------
+        None
+            Updates ``self.model`` in place.
+        """
         if model_type == "xgboost":
             self.model.fit(
                 x_train,
@@ -689,6 +743,28 @@ class ModelTrainingWorkflow():
         threshold: float,
         contrafactual_flag_exists: bool,
     ):
+        """Score train, validation, and test splits and collect metrics.
+
+        When ``contrafactual_flag_exists`` is True, also evaluates the test
+        subset where ``self.x_test_preproc["contrafactual_flag"] == 1``.
+
+        Parameters
+        ----------
+        x_train, x_validation, x_test : pd.DataFrame
+            Feature frames used for ``predict_proba`` (flag column already dropped).
+        threshold : float
+            Probability cutoff for converting scores to binary labels.
+        contrafactual_flag_exists : bool
+            Whether the original preprocessed test frame still has
+            ``contrafactual_flag`` (True if it was dropped from the training frames).
+
+        Returns
+        -------
+        dict
+            Keys ``train``, ``validation``, and ``test`` each map to
+            ``{"metrics", "y_pred_proba"}``. ``test_contrafactual`` is either
+            None or ``{"metrics", "y_true", "y_pred_proba", "size"}``.
+        """
         y_train_pred_proba = self.model.predict_proba(x_train)[:, 1]
         y_val_pred_proba = self.model.predict_proba(x_validation)[:, 1]
         y_test_pred_proba = self.model.predict_proba(x_test)[:, 1]
@@ -742,6 +818,21 @@ class ModelTrainingWorkflow():
         return evaluation
 
     def _make_training_figures(self, evaluation: dict, x_train):
+        """Build PR, KS, histogram, calibration, learning-curve, and importance plots.
+
+        Parameters
+        ----------
+        evaluation : dict
+            Output of ``_evaluate_splits``.
+        x_train : pd.DataFrame
+            Training features used for feature-importance labels.
+
+        Returns
+        -------
+        dict
+            Matplotlib figures keyed by plot name (e.g. ``ks_curve_test``).
+            Includes contrafactual plots when that subset was evaluated.
+        """
         figures = {}
         split_truth = (
             ("training", "train", self.y_train),
@@ -807,6 +898,34 @@ class ModelTrainingWorkflow():
         evaluation: dict,
         figures: dict,
     ):
+        """Log params, metrics, figures, and the fitted model to the active MLflow run.
+
+        Must be called inside an active MLflow run. Skips CatBoost
+        ``cat_features`` in the param dict unless it is a non-None list, in
+        which case it is logged as a comma-separated string.
+
+        Parameters
+        ----------
+        model_type : str
+            ``"xgboost"`` or ``"catboost"`` (MLflow flavor and logged param).
+        model_params : dict
+            Constructor kwargs from ``_instantiate_model``.
+        threshold : float
+            Classification threshold used at evaluation.
+        contrafactual_flag_exists : bool
+            Logged as ``contrafactual_flag_dropped``.
+        x_train, x_validation, x_test : pd.DataFrame
+            Frames used for sizes, feature count, and model signature.
+        evaluation : dict
+            Output of ``_evaluate_splits``.
+        figures : dict
+            Output of ``_make_training_figures``, stored under artifact path
+            ``plots``.
+
+        Returns
+        -------
+        None
+        """
         from modeling_fraud_system.ml_flow import (
             log_figures_to_mlflow,
             log_metrics_to_mlflow,
@@ -883,9 +1002,56 @@ class ModelTrainingWorkflow():
     ):
         """Train an XGBoost or CatBoost model and evaluate train/validation/test.
 
-        Training, threshold selection, metrics, and plots always run. When
-        ``log_into_mlflow`` is True, the same results are written to the MLflow
-        experiment on ``self.run_time_config``; when False they stay local.
+        Uses fixed hyperparameters (no search). If ``threshold`` is omitted, the
+        F1-maximizing cutoff is taken from the validation set. Plots are always
+        generated; they are shown only when ``show_plots`` is True.
+
+        When ``log_into_mlflow`` is True, params, metrics, figures, and the model
+        are written to the MLflow experiment on ``self.run_time_config``.
+
+        Parameters
+        ----------
+        hyperparameters : dict, optional
+            Overrides merged on top of model defaults.
+        threshold : float, optional
+            Probability cutoff. If None, computed with ``get_max_f1_threshold``
+            on the validation set.
+        run_name : str, optional
+            MLflow run name. Falls back to ``mlflow_run_name`` on the runtime
+            config, then ``train_{model_type}``.
+        model_type : str, default="xgboost"
+            ``"xgboost"`` or ``"catboost"``.
+        categorical_features : list, optional
+            CatBoost categorical feature names or indices.
+        log_into_mlflow : bool, default=False
+            If True, log results and persist the model in MLflow.
+        show_plots : bool, default=True
+            If True, display generated figures before closing them.
+        verbose : bool, default=False
+            Training verbosity forwarded to the estimator.
+        seed : int, default=42
+            Random seed for the classifier.
+
+        Returns
+        -------
+        dict
+            ``threshold``, ``train_metrics``, ``val_metrics``, ``test_metrics``,
+            and ``test_contrafactual_metrics`` (None if that subset is absent).
+
+        Raises
+        ------
+        ValueError
+            If ``model_type`` is not ``xgboost`` or ``catboost``, or if
+            preprocessed train/validation/test frames are missing.
+
+        Examples
+        --------
+        >>> results = workflow.train_model(model_type="xgboost", show_plots=False)
+        >>> results = workflow.train_model(
+        ...     model_type="catboost",
+        ...     categorical_features=["country"],
+        ...     log_into_mlflow=True,
+        ... )
         """
         import matplotlib.pyplot as plt
 
@@ -1012,29 +1178,26 @@ class ModelTrainingWorkflow():
         }
 
     def save_model(self):
-        """Save the trained model and configuration to disk.
+        """Save configuration YAML and, if set, the MLflow model as a pickle.
 
-        Loads the best model from MLflow using the URI specified in configuration and
-        saves it as a pickle file along with the configuration in YAML format.
-        Creates timestamped files in the specified output directory.
+        Writes a timestamped config file under ``self.config.model_output_path``.
+        If ``self.config.best_model_uri`` is set, loads that model with
+        ``mlflow.sklearn.load_model`` and pickles it next to the config.
 
         Returns
         -------
         None
-            Saves two files to disk:
-            - config_{timestamp}.yaml: Model configuration
-            - best_model_{timestamp}.pkl: Trained model pickle file
+            Writes ``config_{timestamp}.yaml`` and, when a URI is present,
+            ``best_model_{timestamp}.pkl``.
 
         Notes
         -----
-        Requires that self.config.best_model_uri and self.config.model_output_path
-        are set. If best_model_uri is None, the method returns without saving.
-
-        The output directory is created if it doesn't exist.
+        Requires ``self.config.model_output_path``. If ``best_model_uri`` is
+        missing, the config is still saved and the method returns without a
+        pickle. The output directory is created if it does not exist.
 
         Examples
         --------
-        >>> # Set output path and model URI in config first
         >>> workflow.config.model_output_path = '/path/to/output'
         >>> workflow.config.best_model_uri = 'runs:/abc123/model'
         >>> workflow.save_model()
@@ -1078,83 +1241,67 @@ class ModelTrainingWorkflow():
         mlflow_experiment_path: str = None,
         show_plots: bool = True,
     ):
-        """Evaluate model predictions given a DataFrame with target and probability
-        columns.
+        """Evaluate predictions from a DataFrame of labels and probabilities.
 
-        This static method performs comprehensive evaluation of model predictions including
-        metrics calculation, plot generation, and optional MLflow logging. It evaluates
-        both the full dataset and optionally a contrafactual subset.
+        Computes classification metrics, builds PR/KS/histogram/calibration
+        plots, and optionally logs them to MLflow. If ``threshold`` is omitted,
+        the F1-maximizing cutoff on this DataFrame is used.
 
         Parameters
         ----------
         df : pd.DataFrame
-            DataFrame containing the target column and probability predictions.
+            Frame with the target column and predicted probabilities.
         target_column : str
-            Name of the column containing true target values (0 or 1).
+            Column of true binary labels (0 or 1).
         probability_column : str
-            Name of the column containing predicted probabilities (0.0 to 1.0).
+            Column of predicted positive-class probabilities (0.0 to 1.0).
         threshold : float, optional
-            Classification threshold for converting probabilities to binary predictions.
-            If None (default), automatically calculates optimal threshold using F1 score
-            maximization on the full dataset.
+            Cutoff for converting probabilities to labels. If None, chosen to
+            maximize F1 on ``df``.
         set_name : str, default="evaluation"
-            Name identifier for this evaluation (used in plot titles and logs).
+            Label used in logs, plot titles, and MLflow metric prefixes.
         use_mlflow : bool, default=False
-            Whether to log metrics and plots to MLflow.
+            If True, log params, metrics, and figures to a new MLflow run.
         mlflow_run_name : str, optional
-            Custom name for the MLflow run. If None and use_mlflow=True, uses set_name.
+            MLflow run name. Defaults to ``"{set_name}_evaluation"``.
         mlflow_experiment_path : str, optional
-            MLflow experiment path. Required if use_mlflow=True.
+            MLflow experiment name/path. Required when ``use_mlflow=True``.
         show_plots : bool, default=True
-            Whether to display plots. Only applicable when use_mlflow=False.
+            If True and ``use_mlflow`` is False, display the evaluation plots.
 
         Returns
         -------
         dict
-            Dictionary containing evaluation metrics with keys:
-            - 'metrics': Main evaluation metrics for the full dataset
-            - 'contrafactual_metrics': Metrics for contrafactual subset (if applicable)
-            - 'threshold': Threshold used for binary classification
-            - 'contrafactual_count': Number of contrafactual samples (if applicable)
+            ``metrics`` (output of ``evaluate_model``) and ``threshold``.
 
         Raises
         ------
         ValueError
-            If required columns are missing from the DataFrame.
+            If ``target_column`` or ``probability_column`` is missing, or if
+            ``use_mlflow=True`` without ``mlflow_experiment_path``.
         RuntimeError
-            If use_mlflow=True but MLflow experiment is not found.
+            If ``use_mlflow=True`` but the MLflow experiment does not exist.
 
         Examples
         --------
-        >>> # Basic evaluation without MLflow
         >>> df = pd.DataFrame({
         ...     'target': [0, 1, 0, 1, 1],
         ...     'probability': [0.2, 0.8, 0.3, 0.9, 0.7]
         ... })
-        >>> results = SolvencyNewCustomersModelTraining.evaluate_predictions(
+        >>> results = ModelTrainingWorkflow.evaluate_predictions(
         ...     df=df,
         ...     target_column='target',
         ...     probability_column='probability',
-        ...     threshold=0.5
+        ...     threshold=0.5,
         ... )
 
-        >>> # Evaluation with contrafactual subset
-        >>> df['contrafactual_flag'] = [0, 1, 0, 1, 0]
-        >>> results = SolvencyNewCustomersModelTraining.evaluate_predictions(
-        ...     df=df,
-        ...     target_column='target',
-        ...     probability_column='probability',
-        ...     contrafactual_flag_column='contrafactual_flag'
-        ... )
-
-        >>> # Evaluation with MLflow logging
-        >>> results = SolvencyNewCustomersModelTraining.evaluate_predictions(
+        >>> results = ModelTrainingWorkflow.evaluate_predictions(
         ...     df=df,
         ...     target_column='target',
         ...     probability_column='probability',
         ...     use_mlflow=True,
         ...     mlflow_experiment_path='/experiments/my_model',
-        ...     mlflow_run_name='evaluation_run_1'
+        ...     mlflow_run_name='evaluation_run_1',
         ... )
         """
         import matplotlib.pyplot as plt
