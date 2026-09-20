@@ -9,7 +9,7 @@ The main documentation published **families**, not a pairwise dictionary. Two la
 1. **Official** — information that was confirmed by the dataset onwner.
 2. **Our reading** — names and meanings we are willing to use after looking at values and missingness. Confidence is `high` / `medium` / `low`. We rename `high` only. Keep `C*`, most `D*`, `V*`, and most `id_*` codes as family prefixes — do not invent “C1 = address count”.
 
-The machine-readable map lives in [`src/modeling_fraud_system/ieee_column_dictionary.py`](../src/modeling_fraud_system/ieee_column_dictionary.py) (`rename_ieee_columns()`).
+The machine-readable map lives in [`ieee_column_dictionary.py`](ieee_column_dictionary.py) (`rename_ieee_columns()`).
 
 ---
 
