@@ -9,7 +9,7 @@ import mlflow.sklearn
 import pandas as pd
 from pandas import DataFrame
 
-from modeling_fraud_system.run_time_configuration import BaseConfigParams
+from src.run_time_configuration import BaseConfigParams
 
 log = logging.getLogger(__name__)
 

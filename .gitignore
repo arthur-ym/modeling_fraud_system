@@ -221,3 +221,4 @@ __marimo__/
 docker-commands.md
 data/
 reports/
+mlruns/

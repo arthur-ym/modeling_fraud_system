@@ -17,7 +17,7 @@ from catboost import CatBoostClassifier
 from mlflow.models import infer_signature
 from xgboost import XGBClassifier
 
-from modeling_fraud_system.evaluation import (
+from src.model_training.evaluation import (
     evaluate_model,
     get_max_f1_threshold,
     plot_calibration_bins,
@@ -27,8 +27,8 @@ from modeling_fraud_system.evaluation import (
     plot_pr_curve,
     plot_probability_histogram,
 )
-from modeling_fraud_system.balancing_techniques import balance_data
-from modeling_fraud_system.run_time_configuration import BaseConfigParams,last_day_of_month
+from src.data_processing.balancing_techniques import balance_data
+from src.run_time_configuration import BaseConfigParams, last_day_of_month
 
 mlflow.autolog(disable=True)
 # Configure logging to ensure it prints
@@ -926,7 +926,7 @@ class ModelTrainingWorkflow():
         -------
         None
         """
-        from modeling_fraud_system.ml_flow import (
+        from src.model_training.ml_flow import (
             log_figures_to_mlflow,
             log_metrics_to_mlflow,
             log_params_to_mlflow,
@@ -1128,7 +1128,7 @@ class ModelTrainingWorkflow():
         self.test_metrics = test_metrics
 
         if log_into_mlflow:
-            from modeling_fraud_system.ml_flow import start_mlflow_run
+            from src.model_training.ml_flow import start_mlflow_run
 
             with start_mlflow_run(
                 experiment_name=self.run_time_config.experiment_name,
