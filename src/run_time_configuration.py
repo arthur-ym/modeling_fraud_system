@@ -98,8 +98,7 @@ class BaseConfigParams(BaseModel):
         self.adjust_test_dates(init=True)
         if self.mlflow_run_name == "" or self.mlflow_run_name is None:
             self.mlflow_run_name = (
-
-                + self.training_start_date
+                self.training_start_date
                 + "_"
                 + self.training_end_date
                 + "_"
