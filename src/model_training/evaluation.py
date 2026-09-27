@@ -15,6 +15,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     roc_auc_score,
+    roc_curve,
 )
 
 log = logging.getLogger(__name__)
@@ -57,6 +58,8 @@ def evaluate_model(
         - precision_curve: ndarray
         - recall_curve: ndarray
         - thresholds: ndarray
+        - fpr: ndarray (false positive rates for the ROC curve)
+        - tpr: ndarray (true positive rates for the ROC curve)
 
     Examples
     --------
@@ -70,6 +73,7 @@ def evaluate_model(
     recall = recall_score(y_true, y_pred)
     f1 = f1_score(y_true, y_pred)
     roc_auc = roc_auc_score(y_true, y_pred_proba)
+    fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
 
     # Calculate precision-recall curve
     precision_curve, recall_curve, thresholds = precision_recall_curve(
@@ -98,6 +102,8 @@ def evaluate_model(
         "precision_curve": precision_curve,
         "recall_curve": recall_curve,
         "thresholds": thresholds,
+        "fpr": fpr,
+        "tpr": tpr,
     }
 
 
@@ -141,6 +147,64 @@ def get_max_f1_threshold(model: Any, X: np.ndarray, y: np.ndarray) -> float:
 
     # Return threshold with maximum F1 score
     return thresholds[np.argmax(f1_scores)]
+
+
+def plot_roc_curve(
+    metrics: Dict[str, Any],
+    set_name: str = "validation",
+    title: Optional[str] = None,
+    figsize: Tuple[float, float] = (8, 6),
+) -> plt.Figure:
+    """Create a receiver operating characteristic (ROC) curve plot.
+
+    Generates a matplotlib figure showing the ROC curve for model predictions
+    and the chance diagonal.
+
+    Parameters
+    ----------
+    metrics : dict
+        Dictionary containing 'fpr', 'tpr', and 'auc' keys as returned by
+        evaluate_model.
+    set_name : str, default="validation"
+        Name of the dataset (used in label).
+    title : str, optional
+        Custom title for the plot. If None, generates title from set_name.
+    figsize : tuple of float, default=(8, 6)
+        Figure size as (width, height) in inches.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The generated figure object.
+
+    Examples
+    --------
+    >>> from evaluation_utils import evaluate_model, plot_roc_curve
+    >>> metrics = evaluate_model(y_true, y_pred, y_pred_proba, "test")
+    >>> fig = plot_roc_curve(metrics, set_name="test")
+    >>> fig.savefig("roc_curve.png")
+    >>> plt.close(fig)
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(
+        metrics["fpr"],
+        metrics["tpr"],
+        label=f"{set_name.capitalize()} (AUC={metrics['auc']:.3f})",
+    )
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Chance")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    if title is None:
+        title = f"ROC Curve - {set_name.capitalize()}"
+    ax.set_title(title)
+
+    ax.legend(loc="lower right")
+    ax.grid(True)
+
+    return fig
 
 
 def plot_pr_curve(

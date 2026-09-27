@@ -27,6 +27,7 @@ from src.model_training.evaluation import (
     plot_learning_curves,
     plot_pr_curve,
     plot_probability_histogram,
+    plot_roc_curve,
 )
 from src.data_processing.balancing_techniques import balance_data
 from src.run_time_configuration import BaseConfigParams, last_day_of_month
@@ -819,7 +820,7 @@ class ModelTrainingWorkflow():
         return evaluation
 
     def _make_training_figures(self, evaluation: dict, x_train, top_n_features: int = 20):
-        """Build PR, KS, histogram, calibration, learning-curve, and importance plots.
+        """Build ROC, PR, KS, histogram, calibration, learning-curve, and importance plots.
 
         Parameters
         ----------
@@ -844,6 +845,9 @@ class ModelTrainingWorkflow():
         )
         for set_name, key, y_true in split_truth:
             payload = evaluation[key]
+            figures[f"roc_curve_{set_name}"] = plot_roc_curve(
+                payload["metrics"], set_name=set_name
+            )
             figures[f"precision_recall_curve_{set_name}"] = plot_pr_curve(
                 payload["metrics"], set_name=set_name
             )
@@ -860,6 +864,9 @@ class ModelTrainingWorkflow():
         contrafactual = evaluation["test_contrafactual"]
         if contrafactual is not None:
             set_name = "test_contrafactual"
+            figures[f"roc_curve_{set_name}"] = plot_roc_curve(
+                contrafactual["metrics"], set_name=set_name
+            )
             figures[f"precision_recall_curve_{set_name}"] = plot_pr_curve(
                 contrafactual["metrics"], set_name=set_name
             )
@@ -1264,7 +1271,7 @@ class ModelTrainingWorkflow():
     ):
         """Evaluate predictions from a DataFrame of labels and probabilities.
 
-        Computes classification metrics, builds PR/KS/histogram/calibration
+        Computes classification metrics, builds ROC/PR/KS/histogram/calibration
         plots, and optionally logs them to MLflow. If ``threshold`` is omitted,
         the F1-maximizing cutoff on this DataFrame is used.
 
@@ -1417,6 +1424,10 @@ class ModelTrainingWorkflow():
                 )
 
                 # Create and log plots
+                fig_roc = plot_roc_curve(metrics, set_name=set_name)
+                mlflow.log_figure(fig_roc, f"roc_curve_{set_name}.png")
+                plt.close(fig_roc)
+
                 # PR curve
                 fig_pr = plot_pr_curve(metrics, set_name=set_name)
                 mlflow.log_figure(fig_pr, f"precision_recall_curve_{set_name}.png")
@@ -1442,6 +1453,7 @@ class ModelTrainingWorkflow():
 
         elif show_plots:
             # Display plots without MLflow
+            fig_roc = plot_roc_curve(metrics, set_name=set_name)
             fig_pr = plot_pr_curve(metrics, set_name=set_name)
             fig_ks = plot_ks_curve(y_true, y_pred_proba, set_name=set_name)
             fig_prob = plot_probability_histogram(

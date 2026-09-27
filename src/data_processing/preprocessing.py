@@ -117,6 +117,39 @@ MATCH_FAILURE_COLUMNS = ("M2", "M3", "M5", "M6", "M7", "M8", "M9")
 US_LIKE_CARD_COUNTRY = 150
 LOCAL_BILLING_DISTANCE = 10
 
+# Past-only stats on card_id. Each pair is (name after rename, raw name).
+# Mean and std of amount and of the day-deltas the 0.96 kernel grouped by client.
+CARD_HISTORY_MEAN_STD_COLUMNS: tuple[tuple[str, str | None], ...] = (
+    ("amount_usd", "TransactionAmt"),
+    ("D4", None),
+    ("transaction_time_of_day", "D9"),
+    ("D10", None),
+    ("D15", None),
+)
+# Mean of the count columns except C3, and of the match flags.
+CARD_HISTORY_MEAN_COLUMNS: tuple[tuple[str, str | None], ...] = tuple(
+    (f"C{index}", None) for index in range(1, 15) if index != 3
+) + tuple((f"M{index}", None) for index in range(1, 10))
+# C14 also gets a past standard deviation.
+CARD_HISTORY_STD_COLUMNS: tuple[tuple[str, str | None], ...] = (("C14", None),)
+# How many distinct values this client has already shown.
+CARD_HISTORY_NUNIQUE_COLUMNS: tuple[tuple[str, str | None], ...] = (
+    ("purchaser_email_domain", "P_emaildomain"),
+    ("dist1", None),
+    ("id_02", None),
+    ("amount_cents", "cents"),
+    ("C13", None),
+    ("V314", None),
+    ("V127", None),
+    ("V136", None),
+    ("V309", None),
+    ("V307", None),
+    ("V320", None),
+)
+
+# Inside one V missingness block, a column this correlated with an earlier one is a copy.
+V_CORRELATION_MAX = 0.75
+
 def normalize_ieee_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.replace("-", "_") for c in df.columns]
@@ -651,6 +684,390 @@ def combine_cat_columns(
     return out
 
 
+def _resolve_source(
+    df: pd.DataFrame,
+    preferred: str,
+    fallback: str | None,
+) -> str | None:
+    if preferred in df.columns:
+        return preferred
+    if fallback is not None and fallback in df.columns:
+        return fallback
+    return None
+
+
+def _valid_client_mask(df: pd.DataFrame) -> np.ndarray:
+    """Rows whose card1, billing region, and D1 are all present.
+
+    ``card_id`` is still filled when one of those is missing, but the missing
+    piece becomes the string ``nan`` and would glue unrelated clients together.
+    """
+    region_column = (
+        "billing_region"
+        if "billing_region" in df.columns
+        else "addr1"
+        if "addr1" in df.columns
+        else None
+    )
+    if "card1" in df.columns and region_column is not None and "D1" in df.columns:
+        days = pd.to_numeric(df["D1"], errors="coerce")
+        return (
+            df["card1"].notna() & df[region_column].notna() & days.notna()
+        ).to_numpy()
+    if "card_id" in df.columns:
+        return df["card_id"].notna().to_numpy()
+    return np.zeros(len(df), dtype=bool)
+
+
+def _as_model_number(series: pd.Series) -> np.ndarray:
+    """Float values for a past mean. Match flags T/F become 1/0."""
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64)
+    text = series.astype("string").str.strip().str.upper()
+    blank = text.isna() | text.eq("") | text.eq("<NA>")
+    if bool((blank | text.isin(["T", "F", "TRUE", "FALSE"])).all()):
+        mapped = text.map({"T": 1.0, "F": 0.0, "TRUE": 1.0, "FALSE": 0.0})
+        return mapped.to_numpy(dtype=np.float64)
+    codes, _ = pd.factorize(text.mask(blank), use_na_sentinel=True)
+    values = codes.astype(np.float64)
+    values[codes < 0] = np.nan
+    return values
+
+
+def _factor_codes(series: pd.Series) -> np.ndarray:
+    """Integer codes for a past nunique. Missing is -1."""
+    codes, _ = pd.factorize(series, use_na_sentinel=True)
+    return codes.astype(np.int64, copy=False)
+
+
+def _month_codes(datetimes: pd.Series) -> np.ndarray:
+    stamps = pd.to_datetime(datetimes, utc=True)
+    codes = np.full(len(stamps), -1, dtype=np.int64)
+    valid = stamps.notna().to_numpy()
+    if valid.any():
+        years = stamps.dt.year.to_numpy()
+        months = stamps.dt.month.to_numpy()
+        codes[valid] = years[valid] * 12 + months[valid]
+    return codes
+
+
+def _history_value_columns(
+    df: pd.DataFrame,
+) -> list[tuple[str, set[str], np.ndarray]]:
+    merged: dict[str, set[str]] = {}
+    arrays: dict[str, np.ndarray] = {}
+    order: list[str] = []
+    batches = (
+        (CARD_HISTORY_MEAN_STD_COLUMNS, ("mean", "std")),
+        (CARD_HISTORY_MEAN_COLUMNS, ("mean",)),
+        (CARD_HISTORY_STD_COLUMNS, ("std",)),
+    )
+    for columns, stats in batches:
+        for preferred, fallback in columns:
+            source = _resolve_source(df, preferred, fallback)
+            if source is None:
+                continue
+            if source not in merged:
+                merged[source] = set()
+                order.append(source)
+                arrays[source] = _as_model_number(df[source])
+            merged[source].update(stats)
+    return [(source, merged[source], arrays[source]) for source in order]
+
+
+def _history_nunique_columns(df: pd.DataFrame) -> list[tuple[str, np.ndarray]]:
+    found: list[tuple[str, np.ndarray]] = []
+    for preferred, fallback in CARD_HISTORY_NUNIQUE_COLUMNS:
+        source = _resolve_source(df, preferred, fallback)
+        if source is None:
+            continue
+        found.append((source, _factor_codes(df[source])))
+    return found
+
+
+def _past_mean_std_by_card(
+    card_codes: np.ndarray,
+    values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Mean and sample std of earlier rows in a card, in the order given.
+
+    ``values`` is already sorted by card, then time. The current row is left
+    out of its own mean and std.
+    """
+    n = len(values)
+    mean = np.full(n, np.nan, dtype=np.float64)
+    std = np.full(n, np.nan, dtype=np.float64)
+    if n == 0:
+        return mean, std
+    valid = np.isfinite(values)
+    filled = np.where(valid, values, 0.0)
+    grouped = pd.Series(filled).groupby(card_codes, sort=False)
+    cumulative = grouped.cumsum().to_numpy()
+    cumulative_sq = (
+        pd.Series(filled * filled).groupby(card_codes, sort=False).cumsum().to_numpy()
+    )
+    cumulative_count = (
+        pd.Series(valid.astype(np.float64)).groupby(card_codes, sort=False).cumsum().to_numpy()
+    )
+    previous_sum = cumulative - filled
+    previous_sq = cumulative_sq - filled * filled
+    previous_count = cumulative_count - valid.astype(np.float64)
+    enough_for_mean = previous_count >= 1
+    mean[enough_for_mean] = previous_sum[enough_for_mean] / previous_count[enough_for_mean]
+    enough_for_std = previous_count >= 2
+    variance_num = previous_sq[enough_for_std] - (
+        previous_sum[enough_for_std] ** 2
+    ) / previous_count[enough_for_std]
+    std[enough_for_std] = np.sqrt(
+        np.maximum(variance_num / (previous_count[enough_for_std] - 1.0), 0.0)
+    )
+    return mean, std
+
+
+def _past_nunique_by_card(card_codes: np.ndarray, value_codes: np.ndarray) -> np.ndarray:
+    """How many distinct non-missing codes appeared on earlier rows of this card.
+
+    ``value_codes`` below 0 are missing and do not count. The current row is
+    left out. The first row of a card is NaN.
+    """
+    n = len(card_codes)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n == 0:
+        return out
+    pair = pd.DataFrame({"card": card_codes, "value": value_codes})
+    first_time = (
+        pair.groupby(["card", "value"], sort=False).cumcount().eq(0).to_numpy()
+    )
+    first_time = first_time & (value_codes >= 0)
+    seen = (
+        pd.Series(first_time.astype(np.float64))
+        .groupby(card_codes, sort=False)
+        .cumsum()
+        .to_numpy()
+    )
+    past = seen - first_time.astype(np.float64)
+    new_card = np.empty(n, dtype=bool)
+    new_card[0] = True
+    if n > 1:
+        new_card[1:] = card_codes[1:] != card_codes[:-1]
+    past[new_card] = np.nan
+    out[:] = past
+    return out
+
+
+def _ordered_client_rows(
+    df: pd.DataFrame,
+    card_column: str,
+    time_column: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Positions sorted by card_id then time, and the card code of each.
+
+    Equal timestamps keep the original row order, so the earlier row is the
+    past of the later one.
+    """
+    valid_client = _valid_client_mask(df)
+    valid_time = pd.to_datetime(df[time_column], utc=True).notna().to_numpy()
+    valid_card = df[card_column].notna().to_numpy()
+    valid_idx = np.flatnonzero(valid_client & valid_time & valid_card)
+    if len(valid_idx) == 0:
+        return valid_idx, np.empty(0, dtype=np.int64)
+    time_int, _ = _datetime_int(df[time_column])
+    card_codes, _ = pd.factorize(df[card_column], use_na_sentinel=True)
+    order = valid_idx[
+        np.lexsort((valid_idx, time_int[valid_idx], card_codes[valid_idx]))
+    ]
+    return order, card_codes[order]
+
+
+def add_outsider15_flag(
+    df: pd.DataFrame,
+    d1_column: str = "D1",
+    d15_column: str = "D15",
+) -> pd.DataFrame:
+    """1 when D1 and D15 differ by more than 3 days, else 0.
+
+    Both columns are day counts from some past event. A gap larger than 3 days
+    means this row does not sit on one client's timeline. The 0.96 kernel calls
+    the flag ``outsider15``. A missing D1 or D15 stays missing. Stored as float
+    so numeric feature selection keeps it.
+    """
+    _require_columns(df, (d1_column, d15_column))
+    d1 = pd.to_numeric(df[d1_column], errors="coerce")
+    d15 = pd.to_numeric(df[d15_column], errors="coerce")
+    known = d1.notna() & d15.notna()
+    out = df.copy()
+    out["flag_outsider15"] = (d1 - d15).abs().gt(3).astype(np.float64).where(known)
+    return out
+
+
+def add_card_history_features(
+    df: pd.DataFrame,
+    card_column: str = "card_id",
+    time_column: str = "transaction_datetime",
+) -> pd.DataFrame:
+    """Past-only aggregates for one ``card_id``.
+
+    Each row sees earlier transactions of that client and not later ones, and
+    not other clients. The current row is left out of its own mean, std, and
+    nunique. ``card_id`` stays on the frame; these columns are what the model
+    should use.
+
+    Adds, when the source column exists:
+
+    - ``card_prior_txn_count``: how many earlier payments this client has.
+    - ``card_{column}_mean`` and ``card_{column}_std`` for amount, D4, time of
+      day (D9), D10, and D15.
+    - ``card_{column}_mean`` for C1–C14 except C3, and for M1–M9. T/F match
+      flags are 1/0 before the mean. ``card_C14_std`` is included.
+    - ``card_{column}_nunique`` for purchaser email, dist1, id_02, cents, C13,
+      and V127, V136, V307, V309, V314, V320.
+    - ``card_month_nunique``: distinct calendar months already seen.
+
+    The first payment of a client has a prior count of 0 and missing mean, std,
+    and nunique. A row with no real ``card_id`` (missing card, region, or D1)
+    is missing on every one of these columns.
+    """
+    _require_columns(df, (card_column, time_column))
+    value_columns = _history_value_columns(df)
+    nunique_columns = _history_nunique_columns(df)
+    order, ordered_cards = _ordered_client_rows(df, card_column, time_column)
+    n = len(df)
+    extra: dict[str, np.ndarray] = {}
+
+    prior = np.full(n, np.nan, dtype=np.float64)
+    if len(order):
+        prior[order] = (
+            pd.Series(np.zeros(len(order)))
+            .groupby(ordered_cards, sort=False)
+            .cumcount()
+            .to_numpy(dtype=np.float64)
+        )
+    extra["card_prior_txn_count"] = prior
+
+    for source, stats, values in value_columns:
+        if len(order):
+            mean, std = _past_mean_std_by_card(ordered_cards, values[order])
+        else:
+            mean = std = np.empty(0, dtype=np.float64)
+        if "mean" in stats:
+            column_values = np.full(n, np.nan, dtype=np.float64)
+            if len(order):
+                column_values[order] = mean
+            extra[f"card_{source}_mean"] = column_values
+        if "std" in stats:
+            column_values = np.full(n, np.nan, dtype=np.float64)
+            if len(order):
+                column_values[order] = std
+            extra[f"card_{source}_std"] = column_values
+
+    for source, codes in nunique_columns:
+        column_values = np.full(n, np.nan, dtype=np.float64)
+        if len(order):
+            column_values[order] = _past_nunique_by_card(ordered_cards, codes[order])
+        extra[f"card_{source}_nunique"] = column_values
+
+    month_values = np.full(n, np.nan, dtype=np.float64)
+    if len(order):
+        month_values[order] = _past_nunique_by_card(
+            ordered_cards, _month_codes(df[time_column])[order]
+        )
+    extra["card_month_nunique"] = month_values
+
+    overlap = [name for name in extra if name in df.columns]
+    base = df.drop(columns=overlap) if overlap else df
+    return pd.concat([base, pd.DataFrame(extra, index=df.index)], axis=1)
+
+
+def _v_columns(df: pd.DataFrame) -> list[str]:
+    names = [
+        column
+        for column in df.columns
+        if isinstance(column, str) and column.startswith("V") and column[1:].isdigit()
+    ]
+    return sorted(names, key=lambda name: int(name[1:]))
+
+
+def _is_low_variation(series: pd.Series) -> bool:
+    values = pd.to_numeric(series, errors="coerce")
+    return int(values.nunique(dropna=True)) <= 1
+
+
+def redundant_v_columns(
+    df: pd.DataFrame,
+    threshold: float = V_CORRELATION_MAX,
+) -> list[str]:
+    """V columns that copy another V column, or that never vary.
+
+    Columns missing on exactly the same rows form one block. Inside a block,
+    walk V1, V2, … and drop a column when its absolute correlation with an
+    already kept column is at least ``threshold`` (default 0.75). Columns in
+    different blocks are not compared. A constant or all-missing column is
+    dropped too.
+    """
+    columns = _v_columns(df)
+    if not columns:
+        return []
+
+    groups: list[tuple[np.ndarray, list[str]]] = []
+    for column in columns:
+        mask = df[column].isna().to_numpy(dtype=bool, copy=True)
+        placed = False
+        for group_mask, group_columns in groups:
+            if group_mask.shape == mask.shape and np.array_equal(group_mask, mask):
+                group_columns.append(column)
+                placed = True
+                break
+        if not placed:
+            groups.append((mask, [column]))
+
+    dropped: list[str] = []
+    for mask, group_columns in groups:
+        usable = [column for column in group_columns if not _is_low_variation(df[column])]
+        dropped.extend(column for column in group_columns if column not in usable)
+        if len(usable) < 2 or int((~mask).sum()) < 2:
+            continue
+        block = (
+            df.iloc[np.flatnonzero(~mask)][usable]
+            .apply(pd.to_numeric, errors="coerce")
+            .corr()
+            .abs()
+        )
+        kept: list[str] = []
+        for column in usable:
+            redundant = False
+            for other in kept:
+                correlation = block.at[column, other]
+                if np.isfinite(correlation) and correlation >= threshold:
+                    redundant = True
+                    break
+            if redundant:
+                dropped.append(column)
+            else:
+                kept.append(column)
+    return sorted(set(dropped), key=lambda name: int(name[1:]))
+
+
+def drop_redundant_v_columns(
+    df: pd.DataFrame,
+    threshold: float = V_CORRELATION_MAX,
+) -> pd.DataFrame:
+    """Drop V columns that copy another V column, or that never vary.
+
+    The drop list is chosen from ``df`` itself. ``run_preprocessing`` calls
+    this after the card-history features, so a V column used as a history
+    source can still be counted and then removed.
+    """
+    drop = [
+        column
+        for column in redundant_v_columns(df, threshold=threshold)
+        if column in df.columns
+    ]
+    print("len(drop):", len(drop))
+    if not drop:
+        return df
+    return df.drop(columns=drop)
+
+
 def build_processing_pipeline() -> Pipeline:
     """Pipeline of features whose statistics have to be learned on the training set.
 
@@ -733,14 +1150,19 @@ def run_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
 
     Runs before the time split. ``card_id`` is the client fingerprint, and the
     10-minute velocity is counted on that id, looking backward only.
-    The other flags are fixed rules from the EDA: email provider and mismatch,
-    foreign card, new card, failed match checks, known proxy, amount shape,
-    and far-from-billing distance. ``combine_cat_columns`` joins the categorical
-    pairs that the processing pipeline then target-encodes.
+    ``add_card_history_features`` adds the past-only client means, stds, and
+    nunique counts, and ``add_outsider15_flag`` marks rows whose D1 and D15
+    disagree. The other flags are fixed rules from the EDA: email provider and
+    mismatch, foreign card, new card, failed match checks, known proxy, amount
+    shape, and far-from-billing distance. ``combine_cat_columns`` joins the
+    categorical pairs that the processing pipeline then target-encodes.
+    ``drop_redundant_v_columns`` then removes V columns that copy another V
+    column in this frame, or that never vary.
 
     """
     df = normalize_ieee_columns(df)
     df = rename_columns(df)
+    df = drop_redundant_v_columns(df)
     df = add_transaction_datetime(df)
     df = add_card_id(df)
     df = add_same_card_window_features(df)
@@ -753,6 +1175,8 @@ def run_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
     df = add_amount_shape(df)
     df = add_far_billing_flag(df)
     df = combine_cat_columns(df)
+    df = add_outsider15_flag(df)
+    df = add_card_history_features(df)
     return df
 
 
