@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from scipy.stats import ks_2samp
 from sklearn.metrics import (
     accuracy_score,
@@ -686,6 +687,61 @@ def plot_learning_curves(
     return fig
 
 
+def feature_importance_series(
+    model: Any,
+    feature_names: Optional[Union[List[str], np.ndarray]] = None,
+    importance_type: str = "gain",
+) -> pd.Series:
+    """Feature importances sorted from highest to lowest.
+
+    XGBoost uses ``get_score``. Other models use ``feature_importances_``.
+    Features the booster never split on are omitted.
+    """
+    if hasattr(model, "get_booster"):
+        importance_dict = model.get_booster().get_score(importance_type=importance_type)
+        if feature_names is None:
+            if hasattr(model, "feature_names_in_"):
+                feature_names = model.feature_names_in_
+            else:
+                feature_names = list(importance_dict.keys())
+        if feature_names is not None and len(feature_names) > 0:
+            name_map = {f"f{i}": name for i, name in enumerate(feature_names)}
+            importance_dict = {name_map.get(key, key): value for key, value in importance_dict.items()}
+        importances = pd.Series(importance_dict, dtype="float64")
+    elif hasattr(model, "feature_importances_"):
+        importances = model.feature_importances_
+        if feature_names is None:
+            if hasattr(model, "feature_names_in_"):
+                feature_names = model.feature_names_in_
+            else:
+                feature_names = [f"Feature {i}" for i in range(len(importances))]
+        importances = pd.Series(importances, index=feature_names, dtype="float64")
+    else:
+        raise AttributeError("Model does not have feature importance capabilities.")
+    return importances.sort_values(ascending=False)
+
+
+def top_feature_importance(
+    model: Any,
+    feature_names: Optional[Union[List[str], np.ndarray]] = None,
+    top_n: int = 20,
+    importance_type: str = "gain",
+) -> pd.DataFrame:
+    """Top ``top_n`` features as a table with rank, name, and importance."""
+    if top_n < 1:
+        raise ValueError(f"top_n must be at least 1, got {top_n}")
+    ranked = feature_importance_series(
+        model, feature_names=feature_names, importance_type=importance_type
+    ).head(top_n)
+    return pd.DataFrame(
+        {
+            "rank": range(1, len(ranked) + 1),
+            "feature": ranked.index.astype(str),
+            "importance": ranked.to_numpy(),
+        }
+    )
+
+
 def plot_feature_importance(
     model: Any,
     feature_names: Optional[Union[List[str], np.ndarray]] = None,
@@ -784,54 +840,10 @@ def plot_feature_importance(
     ...                                max_features=30,
     ...                                title='Top 30 Most Important Features')
     """
-    import pandas as pd
-
-    # Try to get feature importances from different model types
     try:
-        # Check if it's an XGBoost model with get_booster method
-        if hasattr(model, "get_booster"):
-            # XGBoost model
-            booster = model.get_booster()
-            importance_dict = booster.get_score(importance_type=importance_type)
-
-            # If feature_names not provided, try to get from model
-            if feature_names is None:
-                if hasattr(model, "feature_names_in_"):
-                    feature_names = model.feature_names_in_
-                else:
-                    # Use feature indices from importance dict
-                    feature_names = list(importance_dict.keys())
-
-            # Create a mapping if feature_names is provided
-            if feature_names is not None and len(feature_names) > 0:
-                # Map f0, f1, ... to actual feature names
-                name_map = {f"f{i}": name for i, name in enumerate(feature_names)}
-                importance_dict = {
-                    name_map.get(k, k): v for k, v in importance_dict.items()
-                }
-
-            # Convert to pandas Series
-            importances = pd.Series(importance_dict)
-
-        elif hasattr(model, "feature_importances_"):
-            # Scikit-learn style models (RandomForest, GradientBoosting, etc.)
-            importances = model.feature_importances_
-
-            # Get feature names
-            if feature_names is None:
-                if hasattr(model, "feature_names_in_"):
-                    feature_names = model.feature_names_in_
-                else:
-                    feature_names = [f"Feature {i}" for i in range(len(importances))]
-
-            # Convert to pandas Series
-            importances = pd.Series(importances, index=feature_names)
-
-        else:
-            raise AttributeError("Model does not have feature importance capabilities.")
-
-        # Sort by importance and get top features
-        importances = importances.sort_values(ascending=True).tail(max_features)
+        importances = feature_importance_series(
+            model, feature_names=feature_names, importance_type=importance_type
+        ).head(max_features).sort_values(ascending=True)
 
         # Create figure
         fig, ax = plt.subplots(figsize=figsize)

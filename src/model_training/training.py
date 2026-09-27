@@ -22,6 +22,7 @@ from src.model_training.evaluation import (
     get_max_f1_threshold,
     plot_calibration_bins,
     plot_feature_importance,
+    top_feature_importance,
     plot_ks_curve,
     plot_learning_curves,
     plot_pr_curve,
@@ -817,7 +818,7 @@ class ModelTrainingWorkflow():
         log.info(f"Contrafactual subset size: {mask.sum()} samples")
         return evaluation
 
-    def _make_training_figures(self, evaluation: dict, x_train):
+    def _make_training_figures(self, evaluation: dict, x_train, top_n_features: int = 20):
         """Build PR, KS, histogram, calibration, learning-curve, and importance plots.
 
         Parameters
@@ -826,6 +827,8 @@ class ModelTrainingWorkflow():
             Output of ``_evaluate_splits``.
         x_train : pd.DataFrame
             Training features used for feature-importance labels.
+        top_n_features : int, default=20
+            How many features to include in the importance plot.
 
         Returns
         -------
@@ -880,7 +883,7 @@ class ModelTrainingWorkflow():
         figures["feature_importance"] = plot_feature_importance(
             self.model,
             feature_names=x_train.columns,
-            max_features=20,
+            max_features=top_n_features,
             importance_type="gain",
         )
         return figures
@@ -897,6 +900,7 @@ class ModelTrainingWorkflow():
         x_test,
         evaluation: dict,
         figures: dict,
+        top_features: pd.DataFrame,
     ):
         """Log params, metrics, figures, and the fitted model to the active MLflow run.
 
@@ -984,6 +988,8 @@ class ModelTrainingWorkflow():
 
         log_metrics_to_mlflow(metrics)
         log_figures_to_mlflow(figures, artifact_path="plots")
+        log_params_to_mlflow({"top_n_features": len(top_features)})
+        mlflow.log_table(top_features, artifact_file="feature_importance/top_features.json")
 
         signature = infer_signature(x_train, self.model.predict_proba(x_train))
         save_model_into_mlflow(self.model, flavor=model_type, signature=signature)
@@ -999,6 +1005,7 @@ class ModelTrainingWorkflow():
         show_plots: bool = True,
         verbose: bool = False,
         seed: int = 42,
+        top_n_features: int = 20,
     ):
         """Train an XGBoost or CatBoost model and evaluate train/validation/test.
 
@@ -1031,12 +1038,16 @@ class ModelTrainingWorkflow():
             Training verbosity forwarded to the estimator.
         seed : int, default=42
             Random seed for the classifier.
+        top_n_features : int, default=20
+            How many highest-gain features to plot and, when MLflow logging is
+            on, to store as ``feature_importance/top_features.json``.
 
         Returns
         -------
         dict
             ``threshold``, ``train_metrics``, ``val_metrics``, ``test_metrics``,
-            and ``test_contrafactual_metrics`` (None if that subset is absent).
+            ``test_contrafactual_metrics`` (None if that subset is absent), and
+            ``top_features``.
 
         Raises
         ------
@@ -1121,7 +1132,15 @@ class ModelTrainingWorkflow():
                 f"Recall: {metrics['recall']:.4f}, F1: {metrics['f1']:.4f}"
             )
 
-        figures = self._make_training_figures(evaluation, x_train)
+        top_features = top_feature_importance(
+            self.model,
+            feature_names=x_train.columns,
+            top_n=top_n_features,
+            importance_type="gain",
+        )
+        figures = self._make_training_figures(
+            evaluation, x_train, top_n_features=top_n_features
+        )
         self.threshold = threshold
         self.train_metrics = train_metrics
         self.val_metrics = val_metrics
@@ -1153,6 +1172,7 @@ class ModelTrainingWorkflow():
                     x_test=x_test,
                     evaluation=evaluation,
                     figures=figures,
+                    top_features=top_features,
                 )
             log.info(
                 f"Model training completed successfully using {model_type} (logged to MLflow)."
@@ -1175,6 +1195,7 @@ class ModelTrainingWorkflow():
             "test_contrafactual_metrics": (
                 None if contrafactual is None else contrafactual["metrics"]
             ),
+            "top_features": top_features,
         }
 
     def save_model(self):

@@ -23,7 +23,6 @@ COLUMN_RENAME: dict[str, str] = {
     "TransactionDT": "seconds_from_reference",
     "TransactionAmt": "amount_usd",
     "ProductCD": "product_channel",
-    "card1": "card_id",
     "card3": "card_issue_country",
     "card4": "card_network",
     "card6": "card_funding_type",
@@ -53,6 +52,36 @@ PLACEHOLDER_EMAIL_DOMAINS = {"anonymous.com"}
 
 # card5 is the BIN-like code. It stays under its original name (medium confidence).
 AMOUNT_GROUP_COLUMNS = ("card5", "product_channel", "card_network")
+
+# Categorical columns whose training fraud rate is a feature.
+# card1, card2, and card5 keep their original names.
+TARGET_RATE_SOURCE_COLUMNS: tuple[str, ...] = (
+    "product_channel",
+    "card1",
+    "card2",
+    "card5",
+    "card_issue_country",
+    "billing_region",
+    "purchaser_email_domain",
+    "recipient_email_domain",
+)
+
+# Pairs joined before the split, then target-encoded with the singles.
+# card1 is paired with the channel. Billing region is paired with the channel
+# and with the issuing country. The two email domains are paired with each other.
+CAT_COMBINATIONS: tuple[tuple[str, ...], ...] = (
+    ("card1", "product_channel"),
+    ("card2", "card5"),
+    ("card2", "product_channel"),
+    ("card5", "product_channel"),
+    ("card5", "card_issue_country"),
+    ("card_issue_country", "product_channel"),
+    ("billing_region", "product_channel"),
+    ("billing_region", "card_issue_country"),
+    ("purchaser_email_domain", "product_channel"),
+    ("recipient_email_domain", "product_channel"),
+    ("purchaser_email_domain", "recipient_email_domain"),
+)
 
 # Same groups as the extensive EDA. Anything else that is filled is "other".
 EMAIL_PROVIDER_GROUPS: dict[str, set[str]] = {
@@ -148,21 +177,67 @@ def _datetime_int(series: pd.Series) -> tuple[np.ndarray, int]:
     return timestamps.astype("int64").to_numpy(), per_second
 
 
+def _column_name(df: pd.DataFrame, preferred: str, fallback: str) -> str:
+    if preferred in df.columns:
+        return preferred
+    if fallback in df.columns:
+        return fallback
+    raise KeyError(f"Expected '{preferred}' or '{fallback}'.")
+
+
+def add_card_id(
+    df: pd.DataFrame,
+    card_column: str = "card1",
+    region_column: str = "billing_region",
+    days_column: str = "D1",
+    seconds_column: str = "seconds_from_reference",
+) -> pd.DataFrame:
+    """Client fingerprint used in place of the raw card token.
+
+    ``card1`` is shared by many clients. ``D1`` is days since that card was
+    first seen, so it changes every day and cannot be part of an id. The
+    first-seen day stays fixed:
+
+    ``D1n = floor(seconds_from_reference / 86400) - D1``
+
+    ``card_id`` is ``card1``, billing region (``addr1``), and ``D1n`` joined
+    with underscores. A missing piece is the string ``nan``.
+    """
+    card_column = _column_name(df, card_column, "card1")
+    region_column = _column_name(df, region_column, "addr1")
+    seconds_column = _column_name(df, seconds_column, "TransactionDT")
+    _require_columns(df, (card_column, region_column, days_column, seconds_column))
+
+    out = df.copy()
+    seconds = pd.to_numeric(out[seconds_column], errors="coerce")
+    days_since_first_seen = pd.to_numeric(out[days_column], errors="coerce")
+    first_seen_day = np.floor(seconds / 86400) - days_since_first_seen
+    out["card_id"] = (
+        out[card_column].astype(str)
+        + "_"
+        + out[region_column].astype(str)
+        + "_"
+        + first_seen_day.astype(str)
+    )
+    return out
+
+
 def add_same_card_window_features(
     df: pd.DataFrame,
     card_column: str = "card_id",
     time_column: str = "transaction_datetime",
     window: str = "10min",
 ) -> pd.DataFrame:
-    """Same-card activity in the previous 10 minutes.
+    """Activity for one ``card_id`` in the previous 10 minutes.
 
-    Looks backward only, so it can run before the train/validation/test split.
-    Adds two columns:
+    ``card_id`` is the client fingerprint from ``add_card_id``, not the raw
+    ``card1`` token. Looks backward only, so it can run before the
+    train/validation/test split. Adds two columns:
 
     - ``card_txn_count_10min``: how many transactions this ``card_id`` has in the
       window, including the current row. An isolated payment is 1.
-    - ``card_txn_delta_10min``: seconds from the earliest other same-card
-      transaction in that window back to now. Missing when the count is 1.
+    - ``card_txn_delta_10min``: seconds from the earliest other transaction with
+      the same ``card_id`` in that window back to now. Missing when the count is 1.
     """
     _require_columns(df, (card_column, time_column))
     out = df.copy()
@@ -375,6 +450,15 @@ def add_far_billing_flag(
     return out
 
 
+def _combined_column_name(columns: tuple[str, ...]) -> str:
+    return "_x_".join(columns)
+
+
+TARGET_RATE_COLUMNS: tuple[str, ...] = TARGET_RATE_SOURCE_COLUMNS + tuple(
+    _combined_column_name(combo) for combo in CAT_COMBINATIONS
+)
+
+
 def _group_tokens(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
     tokens = pd.DataFrame(index=df.index)
     for column in columns:
@@ -388,53 +472,58 @@ def _group_tokens(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
     return tokens
 
 
-class ProductChannelTargetEncoder(BaseEstimator, TransformerMixin):
-    """Fraud rate of the product channel, fit on the training target.
+class CategoricalTargetEncoder(BaseEstimator, TransformerMixin):
+    """Fraud rate of each categorical column, fit on the training target.
 
-    Adds ``product_channel_target_rate`` (ProductCD). ``fit_transform`` on the
-    training rows uses cross-fitting, so a training row is not encoded with its
-    own label. Validation and test use the rates learned from the full training
-    set. An unseen channel gets the overall training fraud rate.
+    ``columns`` defaults to ``TARGET_RATE_COLUMNS``: the single categoricals
+    and the joined pairs from ``combine_cat_columns``. Each column adds
+    ``{column}_target_rate``. ``fit_transform`` on the training rows uses
+    cross-fitting, so a training row is not encoded with its own label.
+    Validation and test use the rates learned from the full training set.
+    An unseen level gets the overall training fraud rate. Missing values are
+    their own level (``__missing__``).
     """
 
     def __init__(
         self,
-        column: str = "product_channel",
-        out_column: str = "product_channel_target_rate",
+        columns: tuple[str, ...] = TARGET_RATE_COLUMNS,
         smooth: str | float = "auto",
         cv: int = 5,
     ):
-        self.column = column
-        self.out_column = out_column
+        self.columns = columns
         self.smooth = smooth
         self.cv = cv
 
     def _encoder(self) -> TargetEncoder:
         return TargetEncoder(target_type="binary", smooth=self.smooth, cv=self.cv)
 
-    def _product_frame(self, X: pd.DataFrame) -> pd.DataFrame:
-        _require_columns(X, (self.column,))
-        return pd.DataFrame({self.column: X[self.column].astype("object").to_numpy()})
+    def _feature_frame(self, X: pd.DataFrame) -> pd.DataFrame:
+        _require_columns(X, self.columns)
+        return _group_tokens(X, self.columns).astype("object")
+
+    def _write_rates(self, X: pd.DataFrame, encoded: np.ndarray) -> pd.DataFrame:
+        if encoded.ndim == 1:
+            encoded = encoded.reshape(-1, 1)
+        out = X.copy()
+        for i, column in enumerate(self.columns):
+            out[f"{column}_target_rate"] = encoded[:, i]
+        return out
 
     def fit(self, X, y=None):
         self.encoder_ = self._encoder()
-        self.encoder_.fit(self._product_frame(X), y)
+        self.encoder_.fit(self._feature_frame(X), y)
         return self
 
     def transform(self, X):
-        encoded = np.asarray(self.encoder_.transform(self._product_frame(X))).ravel()
-        out = X.copy()
-        out[self.out_column] = encoded
-        return out
+        encoded = np.asarray(self.encoder_.transform(self._feature_frame(X)))
+        return self._write_rates(X, encoded)
 
     def fit_transform(self, X, y=None, **fit_params):
         self.encoder_ = self._encoder()
         encoded = np.asarray(
-            self.encoder_.fit_transform(self._product_frame(X), y)
-        ).ravel()
-        out = X.copy()
-        out[self.out_column] = encoded
-        return out
+            self.encoder_.fit_transform(self._feature_frame(X), y)
+        )
+        return self._write_rates(X, encoded)
 
 
 class AmountOverGroupAverage(BaseEstimator, TransformerMixin):
@@ -536,12 +625,41 @@ def _common_email_column(column: str) -> str:
     return f"flag_{column}_common"
 
 
+def combine_cat_columns(
+    df: pd.DataFrame,
+    combinations: tuple[tuple[str, ...], ...] = CAT_COMBINATIONS,
+) -> pd.DataFrame:
+    """Join categorical columns into one token per combination.
+
+    Each piece uses the same rules as the group averages: numeric codes are
+    rounded, text is stripped and lowercased, and a missing piece is
+    ``__missing__``. Pieces are joined with ``|``. The new column is named
+    with ``_x_`` between the source names (``card5_x_product_channel``).
+
+    This is a fixed rewrite, not a rate learned from training, so it runs
+    before the split. The processing pipeline target-encodes the joined columns.
+    """
+    needed = tuple(dict.fromkeys(column for combo in combinations for column in combo))
+    _require_columns(df, needed)
+    tokens = _group_tokens(df, needed)
+    out = df.copy()
+    for combo in combinations:
+        joined = tokens[combo[0]]
+        for column in combo[1:]:
+            joined = joined + "|" + tokens[column]
+        out[_combined_column_name(combo)] = joined
+    return out
+
+
 def build_processing_pipeline() -> Pipeline:
     """Pipeline of features whose statistics have to be learned on the training set.
 
     Fit it on train, then transform validation and test. Steps:
 
-    - ``product_target_encoding``: fraud rate of ``product_channel``.
+    - ``categorical_target_encoding``: fraud rate of each column in
+      ``TARGET_RATE_COLUMNS`` (the single categoricals and the joined pairs
+      from ``combine_cat_columns``). Training rows are cross-fitted. An unseen
+      level gets the overall training fraud rate.
     - ``amount_over_group_avg``: amount divided by the training average for
       BIN + product + card network, with the overall average as fallback.
     - ``common_email_domains``: purchaser and recipient domains that are at
@@ -549,7 +667,7 @@ def build_processing_pipeline() -> Pipeline:
     """
     return Pipeline(
         steps=[
-            ("product_target_encoding", ProductChannelTargetEncoder()),
+            ("categorical_target_encoding", CategoricalTargetEncoder()),
             ("amount_over_group_avg", AmountOverGroupAverage()),
             ("common_email_domains", CommonEmailDomainFlags()),
         ]
@@ -613,14 +731,18 @@ def split_train_validation_test(
 def run_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
     """Cleaning and features that do not need a training-set average.
 
-    Runs before the time split. Card velocity only looks backward in time.
+    Runs before the time split. ``card_id`` is the client fingerprint, and the
+    10-minute velocity is counted on that id, looking backward only.
     The other flags are fixed rules from the EDA: email provider and mismatch,
     foreign card, new card, failed match checks, known proxy, amount shape,
-    and far-from-billing distance.
+    and far-from-billing distance. ``combine_cat_columns`` joins the categorical
+    pairs that the processing pipeline then target-encodes.
+
     """
     df = normalize_ieee_columns(df)
     df = rename_columns(df)
     df = add_transaction_datetime(df)
+    df = add_card_id(df)
     df = add_same_card_window_features(df)
     df = add_email_validity_flags(df)
     df = add_email_provider_features(df)
@@ -630,6 +752,7 @@ def run_preprocessing(df: pd.DataFrame) -> pd.DataFrame:
     df = add_known_proxy_flag(df)
     df = add_amount_shape(df)
     df = add_far_billing_flag(df)
+    df = combine_cat_columns(df)
     return df
 
 
@@ -641,9 +764,10 @@ def run_processing_pipeline(
 ) -> tuple[Pipeline, pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
     """Fit train-only averages and apply them to validation and test.
 
-    The sklearn pipeline adds ``product_channel_target_rate``,
-    ``amount_over_group_avg`` (amount / mean amount of card5 + product + network),
-    and the common-domain flags. Training rows are cross-fitted for the target rate.
+    The sklearn pipeline adds a ``_target_rate`` column for each name in
+    ``TARGET_RATE_COLUMNS``, ``amount_over_group_avg`` (amount / mean amount of
+    card5 + product + network), and the common-domain flags. Training rows are
+    cross-fitted for the target rates.
     """
     pipeline = build_processing_pipeline()
     df_train_out = pipeline.fit_transform(df_train, df_train[target_column])
