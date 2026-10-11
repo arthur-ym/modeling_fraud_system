@@ -57,6 +57,7 @@ class ModelTrainingWorkflow():
     - Optional class balancing on the training set
     - Feature selection and numeric filtering
     - Model training with XGBoost or CatBoost using fixed hyperparameters
+      and early stopping on the validation set
     - Evaluation (AUC, PR-AUC, KS, calibration) and optional MLflow logging
     """
 
@@ -599,6 +600,7 @@ class ModelTrainingWorkflow():
         hyperparameters: dict | None,
         categorical_features: list | None,
         seed: int,
+        early_stopping_rounds: int | None = None,
     ):
         """Build an unfitted XGBoost or CatBoost classifier.
 
@@ -616,6 +618,9 @@ class ModelTrainingWorkflow():
             CatBoost categorical feature names or indices. Ignored for XGBoost.
         seed : int
             Random seed (``seed`` for XGBoost, ``random_seed`` for CatBoost).
+        early_stopping_rounds : int or None, default=None
+            Patience passed to the XGBoost constructor. CatBoost receives this
+            in ``fit`` instead, so it is not stored on the CatBoost params.
 
         Returns
         -------
@@ -624,6 +629,7 @@ class ModelTrainingWorkflow():
             and ``model_params`` is the dict passed to its constructor.
         """
         hyperparameters = dict(hyperparameters or {})
+        hyperparameters.pop("early_stopping_rounds", None)
         if model_type == "xgboost":
             tree_method = hyperparameters.pop("tree_method", "hist")
             objective = hyperparameters.pop("objective", "binary:logistic")
@@ -644,6 +650,8 @@ class ModelTrainingWorkflow():
                 "reg_lambda": 1,
             }
             model_params.update(hyperparameters)
+            if early_stopping_rounds is not None:
+                model_params["early_stopping_rounds"] = early_stopping_rounds
             model = XGBClassifier(**model_params)
         else:
             model_params = {
@@ -691,11 +699,14 @@ class ModelTrainingWorkflow():
         x_validation,
         categorical_features: list | None,
         verbose: bool,
+        early_stopping_rounds: int | None = None,
     ):
         """Fit ``self.model`` on training data with a validation eval set.
 
-        XGBoost uses ``eval_set`` on the raw frames. CatBoost wraps frames in
-        ``Pool`` objects so categorical columns can be passed through.
+        XGBoost uses ``eval_set`` on the raw frames. Early stopping is already
+        set on the estimator and watches the last eval set, which is validation.
+        CatBoost wraps frames in ``Pool`` objects so categorical columns can be
+        passed through, and stops on the validation pool.
 
         Parameters
         ----------
@@ -709,6 +720,9 @@ class ModelTrainingWorkflow():
             CatBoost categorical feature names or indices. Ignored for XGBoost.
         verbose : bool
             Forwarded to the estimator's ``fit`` method.
+        early_stopping_rounds : int or None, default=None
+            CatBoost patience. Ignored for XGBoost, which reads the value from
+            the estimator constructed in ``_instantiate_model``.
 
         Returns
         -------
@@ -735,7 +749,35 @@ class ModelTrainingWorkflow():
         eval_pool = Pool(
             x_validation, self.y_validation, cat_features=categorical_features
         )
-        self.model.fit(train_pool, eval_set=eval_pool, verbose=verbose)
+        fit_kwargs = {}
+        if early_stopping_rounds is not None:
+            fit_kwargs["early_stopping_rounds"] = early_stopping_rounds
+            fit_kwargs["use_best_model"] = True
+        self.model.fit(
+            train_pool, eval_set=eval_pool, verbose=verbose, **fit_kwargs
+        )
+
+    def _best_iteration(self, model_type: str) -> int | None:
+        """Return the boosting round with the best validation score.
+
+        Parameters
+        ----------
+        model_type : str
+            ``"xgboost"`` or CatBoost (any other value).
+
+        Returns
+        -------
+        int or None
+            Best round when early stopping was enabled, otherwise None if the
+            fitted model does not expose one.
+        """
+        if model_type == "xgboost":
+            best = getattr(self.model, "best_iteration", None)
+        else:
+            best = self.model.get_best_iteration()
+        if best is None:
+            return None
+        return int(best)
 
     def _evaluate_splits(
         self,
@@ -908,6 +950,8 @@ class ModelTrainingWorkflow():
         evaluation: dict,
         figures: dict,
         top_features: pd.DataFrame,
+        early_stopping_rounds: int | None = None,
+        best_iteration: int | None = None,
     ):
         """Log params, metrics, figures, and the fitted model to the active MLflow run.
 
@@ -932,6 +976,13 @@ class ModelTrainingWorkflow():
         figures : dict
             Output of ``_make_training_figures``, stored under artifact path
             ``plots``.
+        top_features : pd.DataFrame
+            Highest-gain features, stored as
+            ``feature_importance/top_features.json``.
+        early_stopping_rounds : int or None, default=None
+            Patience logged when early stopping is enabled.
+        best_iteration : int or None, default=None
+            Boosting round with the best validation score.
 
         Returns
         -------
@@ -963,6 +1014,10 @@ class ModelTrainingWorkflow():
             "validation_positive_rate": f"{self.y_validation.mean():.4f}",
             "test_positive_rate": f"{self.y_test.mean():.4f}",
         }
+        if early_stopping_rounds is not None:
+            params["early_stopping_rounds"] = early_stopping_rounds
+        if best_iteration is not None:
+            params["best_iteration"] = best_iteration
         if "cat_features" in model_params and model_params["cat_features"] is not None:
             params["cat_features"] = ",".join(map(str, model_params["cat_features"]))
 
@@ -1013,12 +1068,17 @@ class ModelTrainingWorkflow():
         verbose: bool = False,
         seed: int = 42,
         top_n_features: int = 20,
+        early_stopping_rounds: int | None = 50,
     ):
         """Train an XGBoost or CatBoost model and evaluate train/validation/test.
 
-        Uses fixed hyperparameters (no search). If ``threshold`` is omitted, the
-        F1-maximizing cutoff is taken from the validation set. Plots are always
-        generated; they are shown only when ``show_plots`` is True.
+        Uses fixed hyperparameters (no search). Training stops early when the
+        validation metric does not improve for ``early_stopping_rounds``
+        iterations. XGBoost watches the last eval set (validation) and keeps
+        ``best_iteration`` for prediction. CatBoost keeps the best validation
+        iteration. If ``threshold`` is omitted, the F1-maximizing cutoff is
+        taken from the validation set. Plots are always generated; they are
+        shown only when ``show_plots`` is True.
 
         When ``log_into_mlflow`` is True, params, metrics, figures, and the model
         are written to the MLflow experiment on ``self.run_time_config``.
@@ -1048,18 +1108,24 @@ class ModelTrainingWorkflow():
         top_n_features : int, default=20
             How many highest-gain features to plot and, when MLflow logging is
             on, to store as ``feature_importance/top_features.json``.
+        early_stopping_rounds : int or None, default=50
+            Stop if the validation metric does not improve for this many
+            rounds. ``None`` trains for the full ``n_estimators`` (XGBoost) or
+            ``iterations`` (CatBoost). A value inside ``hyperparameters`` is
+            ignored so both model types share this argument.
 
         Returns
         -------
         dict
             ``threshold``, ``train_metrics``, ``val_metrics``, ``test_metrics``,
-            ``test_contrafactual_metrics`` (None if that subset is absent), and
-            ``top_features``.
+            ``test_contrafactual_metrics`` (None if that subset is absent),
+            ``top_features``, ``early_stopping_rounds``, and ``best_iteration``.
 
         Raises
         ------
         ValueError
-            If ``model_type`` is not ``xgboost`` or ``catboost``, or if
+            If ``model_type`` is not ``xgboost`` or ``catboost``, if
+            ``early_stopping_rounds`` is not a positive integer or None, or if
             preprocessed train/validation/test frames are missing.
 
         Examples
@@ -1073,13 +1139,22 @@ class ModelTrainingWorkflow():
         """
         import matplotlib.pyplot as plt
 
-        log.info(
-            f"Starting model training without hyperparameter tuning using {model_type}."
-        )
         if model_type not in ["xgboost", "catboost"]:
             raise ValueError(
                 f"model_type must be 'xgboost' or 'catboost', got '{model_type}'"
             )
+        if early_stopping_rounds is not None and (
+            isinstance(early_stopping_rounds, bool)
+            or not isinstance(early_stopping_rounds, int)
+            or early_stopping_rounds < 1
+        ):
+            raise ValueError(
+                "early_stopping_rounds must be a positive integer or None, "
+                f"got {early_stopping_rounds!r}."
+            )
+        log.info(
+            f"Starting model training without hyperparameter tuning using {model_type}."
+        )
         if (
             self.x_train_preproc is None
             or self.x_validation_preproc is None
@@ -1090,16 +1165,41 @@ class ModelTrainingWorkflow():
             )
 
         self.model, model_params = self._instantiate_model(
-            model_type, hyperparameters, categorical_features, seed
+            model_type,
+            hyperparameters,
+            categorical_features,
+            seed,
+            early_stopping_rounds=early_stopping_rounds,
         )
         x_train, x_validation, x_test, contrafactual_flag_exists = (
             self._frames_for_training()
         )
 
-        log.info(f"Training {model_type} model with fixed hyperparameters.")
+        if early_stopping_rounds is None:
+            log.info(f"Training {model_type} model with fixed hyperparameters.")
+        else:
+            log.info(
+                f"Training {model_type} model with fixed hyperparameters and "
+                f"early stopping (patience {early_stopping_rounds} on the "
+                "validation set)."
+            )
         self._fit_model(
-            model_type, x_train, x_validation, categorical_features, verbose
+            model_type,
+            x_train,
+            x_validation,
+            categorical_features,
+            verbose,
+            early_stopping_rounds=early_stopping_rounds,
         )
+        best_iteration = (
+            None
+            if early_stopping_rounds is None
+            else self._best_iteration(model_type)
+        )
+        if best_iteration is not None:
+            log.info(f"Best iteration on the validation set: {best_iteration}.")
+        self.early_stopping_rounds = early_stopping_rounds
+        self.best_iteration = best_iteration
 
         if threshold is None:
             threshold = get_max_f1_threshold(
@@ -1180,6 +1280,8 @@ class ModelTrainingWorkflow():
                     evaluation=evaluation,
                     figures=figures,
                     top_features=top_features,
+                    early_stopping_rounds=early_stopping_rounds,
+                    best_iteration=best_iteration,
                 )
             log.info(
                 f"Model training completed successfully using {model_type} (logged to MLflow)."
@@ -1203,6 +1305,8 @@ class ModelTrainingWorkflow():
                 None if contrafactual is None else contrafactual["metrics"]
             ),
             "top_features": top_features,
+            "early_stopping_rounds": early_stopping_rounds,
+            "best_iteration": best_iteration,
         }
 
     def save_model(self):
