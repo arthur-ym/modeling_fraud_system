@@ -100,26 +100,20 @@ def feature_names(feature_table: list) -> list[str]:
     return names
 
 
-def _suggest_xgboost_params(trial: optuna.Trial, fixed: dict) -> dict:
-    """Sample XGBoost parameters, leaving keys in ``fixed`` untouched."""
-    suggested: dict = {}
-    if "max_depth" not in fixed:
-        suggested["max_depth"] = trial.suggest_int("max_depth", 3, 8)
-    if "learning_rate" not in fixed:
-        suggested["learning_rate"] = trial.suggest_float("learning_rate", 0.01, 0.2, log=True)
-    if "min_child_weight" not in fixed:
-        suggested["min_child_weight"] = trial.suggest_float("min_child_weight", 1.0, 50.0, log=True)
-    if "subsample" not in fixed:
-        suggested["subsample"] = trial.suggest_float("subsample", 0.6, 1.0)
-    if "colsample_bytree" not in fixed:
-        suggested["colsample_bytree"] = trial.suggest_float("colsample_bytree", 0.5, 1.0)
-    if "gamma" not in fixed:
-        suggested["gamma"] = trial.suggest_float("gamma", 0.0, 5.0)
-    if "reg_alpha" not in fixed:
-        suggested["reg_alpha"] = trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True)
-    if "reg_lambda" not in fixed:
-        suggested["reg_lambda"] = trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True)
-    return {**suggested, **fixed}
+def _suggest_xgboost_params(trial: optuna.Trial) -> dict:
+    """Sample one XGBoost configuration. ``n_jobs`` stays at 4."""
+    return {
+        "n_estimators": trial.suggest_int("n_estimators", 50, 500),
+        "max_depth": trial.suggest_int("max_depth", 3, 8),
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+        "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 50.0, log=True),
+        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+        "gamma": trial.suggest_float("gamma", 0.0, 5.0),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+        "n_jobs": 4,
+    }
 
 
 def tune_xgboost(
@@ -129,17 +123,17 @@ def tune_xgboost(
     seed: int = 42,
     early_stopping_rounds: int | None = 50,
     early_stopping_min_delta: float = 0.01,
-    fixed_hyperparameters: dict | None = None,
     show_progress: bool = True,
 ) -> optuna.Study:
     """Search XGBoost hyperparameters on the workflow's preprocessed frames.
 
     The workflow must already hold numeric train, validation, and test frames
     (see ``generate_preprocessed_data``). Validation PR-AUC is maximized.
-    ``n_estimators`` stays in ``fixed_hyperparameters`` and is the tree cap;
-    early stopping chooses the round. ``scale_pos_weight`` is not searched.
+    ``n_estimators`` is sampled from 50 to 500 and is the tree cap; early
+    stopping can stop earlier. ``n_jobs`` is always 4. ``scale_pos_weight``
+    is not searched.
 
-    The best trial stores the full parameter dict, including fixed keys, on
+    The best trial stores the full parameter dict on
     ``study.best_trial.user_attrs["hyperparameters"]``.
 
     Parameters
@@ -155,9 +149,6 @@ def tune_xgboost(
         Patience on validation logloss. ``None`` trains for every tree.
     early_stopping_min_delta : float, default=0.01
         Minimum absolute logloss improvement versus the best validation score.
-    fixed_hyperparameters : dict, optional
-        Parameters kept constant. Defaults to 200 trees and 4 threads.
-        Keys listed here are not sampled.
     show_progress : bool, default=True
         Show the Optuna progress bar.
 
@@ -185,10 +176,6 @@ def tune_xgboost(
             "Preprocessed train, validation, and test frames are required before tuning."
         )
 
-    fixed = {"n_estimators": 200, "n_jobs": 4}
-    if fixed_hyperparameters:
-        fixed.update(fixed_hyperparameters)
-
     x_train, x_validation, _, _ = workflow._frames_for_training()
     y_validation = np.asarray(workflow.y_validation)
     log.info(
@@ -199,7 +186,7 @@ def tune_xgboost(
     )
 
     def objective(trial: optuna.Trial) -> float:
-        params = _suggest_xgboost_params(trial, fixed)
+        params = _suggest_xgboost_params(trial)
         workflow.model, _ = workflow._instantiate_model(
             "xgboost",
             params,
