@@ -32,6 +32,58 @@ from src.model_training.evaluation import (
 from src.data_processing.balancing_techniques import balance_data
 from src.run_time_configuration import BaseConfigParams, last_day_of_month
 
+def _higher_is_better(metric_name: str) -> bool:
+    """True when a larger validation score is an improvement."""
+    return metric_name.lower().startswith(
+        ("auc", "accuracy", "precision", "recall", "f1", "map", "ndcg", "r2")
+    )
+
+
+class _MinDeltaEarlyStopping:
+    """Stop CatBoost unless the validation metric improves by ``min_delta``.
+
+    CatBoost ``early_stopping_rounds`` treats any change as an improvement.
+    This callback uses the same rule as ``xgboost.callback.EarlyStopping``:
+    a new score counts only when it beats the best score by more than
+    ``min_delta``. Returning False from ``after_iteration`` stops training.
+    """
+
+    def __init__(self, rounds: int, min_delta: float):
+        self.rounds = rounds
+        self.min_delta = min_delta
+        self.best_score: float | None = None
+        self.best_iteration: int | None = None
+        self._rounds_since_best = 0
+        self._metric_name: str | None = None
+
+    def after_iteration(self, info) -> bool:
+        validation = info.metrics.get("validation")
+        if not validation:
+            for name, values in info.metrics.items():
+                if name != "learn":
+                    validation = values
+                    break
+        if not validation:
+            return True
+        if self._metric_name is None or self._metric_name not in validation:
+            self._metric_name = list(validation.keys())[-1]
+        history = validation[self._metric_name]
+        score = float(history[-1])
+        iteration = len(history) - 1
+        if self.best_score is None or self._improved(score):
+            self.best_score = score
+            self.best_iteration = iteration
+            self._rounds_since_best = 0
+            return True
+        self._rounds_since_best += 1
+        return self._rounds_since_best < self.rounds
+
+    def _improved(self, score: float) -> bool:
+        if _higher_is_better(self._metric_name):
+            return score - self.min_delta > self.best_score
+        return self.best_score - self.min_delta > score
+
+
 mlflow.autolog(disable=True)
 # Configure logging to ensure it prints
 logging.basicConfig(
@@ -601,6 +653,7 @@ class ModelTrainingWorkflow():
         categorical_features: list | None,
         seed: int,
         early_stopping_rounds: int | None = None,
+        early_stopping_min_delta: float = 0.01,
     ):
         """Build an unfitted XGBoost or CatBoost classifier.
 
@@ -619,8 +672,13 @@ class ModelTrainingWorkflow():
         seed : int
             Random seed (``seed`` for XGBoost, ``random_seed`` for CatBoost).
         early_stopping_rounds : int or None, default=None
-            Patience passed to the XGBoost constructor. CatBoost receives this
-            in ``fit`` instead, so it is not stored on the CatBoost params.
+            Patience. XGBoost receives it through an ``EarlyStopping`` callback
+            so ``min_delta`` can be set. CatBoost receives the same threshold
+            from a callback in ``_fit_model``. Neither value is stored on the
+            constructor params that get logged.
+        early_stopping_min_delta : float, default=0.01
+            Smallest absolute validation-metric change that counts as an
+            improvement. Compared with the best score so far.
 
         Returns
         -------
@@ -630,6 +688,7 @@ class ModelTrainingWorkflow():
         """
         hyperparameters = dict(hyperparameters or {})
         hyperparameters.pop("early_stopping_rounds", None)
+        hyperparameters.pop("early_stopping_min_delta", None)
         if model_type == "xgboost":
             tree_method = hyperparameters.pop("tree_method", "hist")
             objective = hyperparameters.pop("objective", "binary:logistic")
@@ -650,9 +709,18 @@ class ModelTrainingWorkflow():
                 "reg_lambda": 1,
             }
             model_params.update(hyperparameters)
-            if early_stopping_rounds is not None:
-                model_params["early_stopping_rounds"] = early_stopping_rounds
             model = XGBClassifier(**model_params)
+            if early_stopping_rounds is not None:
+                from xgboost.callback import EarlyStopping
+
+                model.set_params(
+                    callbacks=[
+                        EarlyStopping(
+                            rounds=early_stopping_rounds,
+                            min_delta=early_stopping_min_delta,
+                        )
+                    ]
+                )
         else:
             model_params = {
                 "random_seed": seed,
@@ -700,13 +768,16 @@ class ModelTrainingWorkflow():
         categorical_features: list | None,
         verbose: bool,
         early_stopping_rounds: int | None = None,
+        early_stopping_min_delta: float = 0.01,
     ):
         """Fit ``self.model`` on training data with a validation eval set.
 
         XGBoost uses ``eval_set`` on the raw frames. Early stopping is already
         set on the estimator and watches the last eval set, which is validation.
         CatBoost wraps frames in ``Pool`` objects so categorical columns can be
-        passed through, and stops on the validation pool.
+        passed through, and stops when the validation metric does not beat the
+        best score by ``early_stopping_min_delta`` for ``early_stopping_rounds``
+        rounds. The fitted CatBoost model is then shrunk to that best round.
 
         Parameters
         ----------
@@ -723,6 +794,8 @@ class ModelTrainingWorkflow():
         early_stopping_rounds : int or None, default=None
             CatBoost patience. Ignored for XGBoost, which reads the value from
             the estimator constructed in ``_instantiate_model``.
+        early_stopping_min_delta : float, default=0.01
+            CatBoost minimum absolute improvement. Ignored for XGBoost.
 
         Returns
         -------
@@ -750,12 +823,21 @@ class ModelTrainingWorkflow():
             x_validation, self.y_validation, cat_features=categorical_features
         )
         fit_kwargs = {}
+        stopper = None
         if early_stopping_rounds is not None:
-            fit_kwargs["early_stopping_rounds"] = early_stopping_rounds
-            fit_kwargs["use_best_model"] = True
+            stopper = _MinDeltaEarlyStopping(
+                rounds=early_stopping_rounds,
+                min_delta=early_stopping_min_delta,
+            )
+            fit_kwargs["callbacks"] = [stopper]
         self.model.fit(
             train_pool, eval_set=eval_pool, verbose=verbose, **fit_kwargs
         )
+        if stopper is not None and stopper.best_iteration is not None:
+            kept_trees = stopper.best_iteration + 1
+            if kept_trees < self.model.tree_count_:
+                self.model.shrink(ntree_end=kept_trees)
+            self.model._early_stop_best_iteration = stopper.best_iteration
 
     def _best_iteration(self, model_type: str) -> int | None:
         """Return the boosting round with the best validation score.
@@ -771,6 +853,9 @@ class ModelTrainingWorkflow():
             Best round when early stopping was enabled, otherwise None if the
             fitted model does not expose one.
         """
+        custom = getattr(self.model, "_early_stop_best_iteration", None)
+        if custom is not None:
+            return int(custom)
         if model_type == "xgboost":
             best = getattr(self.model, "best_iteration", None)
         else:
@@ -951,6 +1036,7 @@ class ModelTrainingWorkflow():
         figures: dict,
         top_features: pd.DataFrame,
         early_stopping_rounds: int | None = None,
+        early_stopping_min_delta: float | None = None,
         best_iteration: int | None = None,
     ):
         """Log params, metrics, figures, and the fitted model to the active MLflow run.
@@ -981,6 +1067,8 @@ class ModelTrainingWorkflow():
             ``feature_importance/top_features.json``.
         early_stopping_rounds : int or None, default=None
             Patience logged when early stopping is enabled.
+        early_stopping_min_delta : float or None, default=None
+            Minimum absolute validation improvement logged with early stopping.
         best_iteration : int or None, default=None
             Boosting round with the best validation score.
 
@@ -996,7 +1084,11 @@ class ModelTrainingWorkflow():
         )
 
         params = {
-            **{key: value for key, value in model_params.items() if key != "cat_features"},
+            **{
+                key: value
+                for key, value in model_params.items()
+                if key not in {"cat_features", "callbacks"}
+            },
             "model_type": model_type,
             "threshold": threshold,
             "contrafactual_flag_dropped": contrafactual_flag_exists,
@@ -1016,6 +1108,8 @@ class ModelTrainingWorkflow():
         }
         if early_stopping_rounds is not None:
             params["early_stopping_rounds"] = early_stopping_rounds
+        if early_stopping_min_delta is not None:
+            params["early_stopping_min_delta"] = early_stopping_min_delta
         if best_iteration is not None:
             params["best_iteration"] = best_iteration
         if "cat_features" in model_params and model_params["cat_features"] is not None:
@@ -1069,16 +1163,19 @@ class ModelTrainingWorkflow():
         seed: int = 42,
         top_n_features: int = 20,
         early_stopping_rounds: int | None = 50,
+        early_stopping_min_delta: float = 0.01,
     ):
         """Train an XGBoost or CatBoost model and evaluate train/validation/test.
 
         Uses fixed hyperparameters (no search). Training stops early when the
-        validation metric does not improve for ``early_stopping_rounds``
-        iterations. XGBoost watches the last eval set (validation) and keeps
-        ``best_iteration`` for prediction. CatBoost keeps the best validation
-        iteration. If ``threshold`` is omitted, the F1-maximizing cutoff is
-        taken from the validation set. Plots are always generated; they are
-        shown only when ``show_plots`` is True.
+        validation metric does not beat its best value by more than
+        ``early_stopping_min_delta`` for ``early_stopping_rounds`` iterations.
+        For logloss, that means the new score must be lower than
+        ``best - early_stopping_min_delta``. XGBoost watches the last eval set
+        (validation) and keeps ``best_iteration`` for prediction. CatBoost is
+        shrunk to that same round. If ``threshold`` is omitted, the
+        F1-maximizing cutoff is taken from the validation set. Plots are always
+        generated; they are shown only when ``show_plots`` is True.
 
         When ``log_into_mlflow`` is True, params, metrics, figures, and the model
         are written to the MLflow experiment on ``self.run_time_config``.
@@ -1113,20 +1210,26 @@ class ModelTrainingWorkflow():
             rounds. ``None`` trains for the full ``n_estimators`` (XGBoost) or
             ``iterations`` (CatBoost). A value inside ``hyperparameters`` is
             ignored so both model types share this argument.
+        early_stopping_min_delta : float, default=0.01
+            Minimum absolute change versus the best validation score that
+            counts as an improvement. ``0`` restores the old rule, where any
+            improvement resets the patience counter.
 
         Returns
         -------
         dict
             ``threshold``, ``train_metrics``, ``val_metrics``, ``test_metrics``,
             ``test_contrafactual_metrics`` (None if that subset is absent),
-            ``top_features``, ``early_stopping_rounds``, and ``best_iteration``.
+            ``top_features``, ``early_stopping_rounds``,
+            ``early_stopping_min_delta``, and ``best_iteration``.
 
         Raises
         ------
         ValueError
             If ``model_type`` is not ``xgboost`` or ``catboost``, if
-            ``early_stopping_rounds`` is not a positive integer or None, or if
-            preprocessed train/validation/test frames are missing.
+            ``early_stopping_rounds`` is not a positive integer or None, if
+            ``early_stopping_min_delta`` is negative, or if preprocessed
+            train/validation/test frames are missing.
 
         Examples
         --------
@@ -1152,6 +1255,15 @@ class ModelTrainingWorkflow():
                 "early_stopping_rounds must be a positive integer or None, "
                 f"got {early_stopping_rounds!r}."
             )
+        if (
+            isinstance(early_stopping_min_delta, bool)
+            or not isinstance(early_stopping_min_delta, (int, float))
+            or early_stopping_min_delta < 0
+        ):
+            raise ValueError(
+                "early_stopping_min_delta must be a non-negative number, "
+                f"got {early_stopping_min_delta!r}."
+            )
         log.info(
             f"Starting model training without hyperparameter tuning using {model_type}."
         )
@@ -1170,6 +1282,7 @@ class ModelTrainingWorkflow():
             categorical_features,
             seed,
             early_stopping_rounds=early_stopping_rounds,
+            early_stopping_min_delta=early_stopping_min_delta,
         )
         x_train, x_validation, x_test, contrafactual_flag_exists = (
             self._frames_for_training()
@@ -1180,8 +1293,8 @@ class ModelTrainingWorkflow():
         else:
             log.info(
                 f"Training {model_type} model with fixed hyperparameters and "
-                f"early stopping (patience {early_stopping_rounds} on the "
-                "validation set)."
+                f"early stopping (patience {early_stopping_rounds}, minimum "
+                f"validation improvement {early_stopping_min_delta})."
             )
         self._fit_model(
             model_type,
@@ -1190,6 +1303,7 @@ class ModelTrainingWorkflow():
             categorical_features,
             verbose,
             early_stopping_rounds=early_stopping_rounds,
+            early_stopping_min_delta=early_stopping_min_delta,
         )
         best_iteration = (
             None
@@ -1199,6 +1313,9 @@ class ModelTrainingWorkflow():
         if best_iteration is not None:
             log.info(f"Best iteration on the validation set: {best_iteration}.")
         self.early_stopping_rounds = early_stopping_rounds
+        self.early_stopping_min_delta = (
+            None if early_stopping_rounds is None else float(early_stopping_min_delta)
+        )
         self.best_iteration = best_iteration
 
         if threshold is None:
@@ -1281,6 +1398,7 @@ class ModelTrainingWorkflow():
                     figures=figures,
                     top_features=top_features,
                     early_stopping_rounds=early_stopping_rounds,
+                    early_stopping_min_delta=self.early_stopping_min_delta,
                     best_iteration=best_iteration,
                 )
             log.info(
@@ -1306,6 +1424,7 @@ class ModelTrainingWorkflow():
             ),
             "top_features": top_features,
             "early_stopping_rounds": early_stopping_rounds,
+            "early_stopping_min_delta": self.early_stopping_min_delta,
             "best_iteration": best_iteration,
         }
 
