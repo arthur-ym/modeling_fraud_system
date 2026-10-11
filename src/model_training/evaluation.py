@@ -568,6 +568,23 @@ def plot_calibration_bins(
     return fig
 
 
+def _learning_curve_label(eval_set: str) -> str:
+    """Map an eval-set key to a legend label.
+
+    XGBoost names the sets ``validation_0``, ``validation_1``, ... in the order
+    passed to ``fit``. This project passes train first and validation second.
+    CatBoost uses ``learn`` and ``validation``.
+    """
+    name = eval_set.lower()
+    if name in {"learn", "validation_0", "train"}:
+        return "Train"
+    if name in {"validation", "validation_1", "valid"}:
+        return "Validation"
+    if name.startswith("validation_"):
+        return f"Set {name.removeprefix('validation_')}"
+    return eval_set.replace("_", " ").title()
+
+
 def plot_learning_curves(
     model: Any,
     metric: str = "logloss",
@@ -613,13 +630,15 @@ def plot_learning_curves(
     results available.
 
     For XGBoost:
-        - Expects evaluation sets named 'validation_0' (training set)
-          and 'validation_1' (validation/test set).
-        - Access results via model.evals_result()
+        - Expects evaluation sets named ``validation_0`` (training set) and
+          ``validation_1`` (validation set), matching the order passed to
+          ``fit``. Names are matched case-insensitively because XGBoost 3
+          stores the same history on ``evals_result_``.
+        - Access results via ``model.evals_result()``.
 
     For CatBoost:
-        - Expects 'learn' (training set) and 'validation' (validation set).
-        - Access results via model.evals_result_
+        - Expects ``learn`` (training set) and ``validation`` (validation set).
+        - Access results via ``model.evals_result_``.
 
     Examples
     --------
@@ -640,8 +659,14 @@ def plot_learning_curves(
     ...                            title='Model AUC Over Iterations')
     >>> plt.show()
     """
-    # Check if model is CatBoost or XGBoost
-    is_catboost = hasattr(model, "evals_result_")
+    # XGBoost 3 also stores history on evals_result_, so the attribute alone
+    # is not enough to tell the two libraries apart.
+    is_xgboost = type(model).__name__.startswith("XGB") or (
+        hasattr(model, "get_booster") and callable(getattr(model, "evals_result", None))
+    )
+    is_catboost = (not is_xgboost) and (
+        type(model).__name__.startswith("CatBoost") or hasattr(model, "evals_result_")
+    )
 
     if is_catboost:
         # CatBoost model
@@ -686,15 +711,11 @@ def plot_learning_curves(
         # Plot learning curves for each evaluation set
         for eval_set in eval_sets:
             if metric in results[eval_set]:
-                # Determine label based on eval_set name
-                if eval_set == "learn":
-                    label = "Train"
-                elif eval_set == "validation":
-                    label = "Validation"
-                else:
-                    label = eval_set.capitalize()
-
-                ax.plot(results[eval_set][metric], label=label, linewidth=2)
+                ax.plot(
+                    results[eval_set][metric],
+                    label=_learning_curve_label(eval_set),
+                    linewidth=2,
+                )
     else:
         # XGBoost model
         results = model.evals_result()
@@ -728,15 +749,11 @@ def plot_learning_curves(
         # Plot learning curves for each evaluation set
         for eval_set in eval_sets:
             if metric in results[eval_set]:
-                # Determine label based on eval_set name
-                if eval_set == "validation_0":
-                    label = "Train"
-                elif eval_set == "validation_1":
-                    label = "Validation"
-                else:
-                    label = eval_set.replace("validation_", "Set ")
-
-                ax.plot(results[eval_set][metric], label=label, linewidth=2)
+                ax.plot(
+                    results[eval_set][metric],
+                    label=_learning_curve_label(eval_set),
+                    linewidth=2,
+                )
 
     ax.set_xlabel("Iteration")
     ax.set_ylabel(metric.capitalize())
