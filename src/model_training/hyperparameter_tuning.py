@@ -103,15 +103,15 @@ def feature_names(feature_table: list) -> list[str]:
 def _suggest_xgboost_params(trial: optuna.Trial) -> dict:
     """Sample one XGBoost configuration. ``n_jobs`` stays at 4."""
     return {
-        "n_estimators": trial.suggest_int("n_estimators", 50, 500),
-        "max_depth": trial.suggest_int("max_depth", 3, 8),
-        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
-        "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 50.0, log=True),
-        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-        "gamma": trial.suggest_float("gamma", 0.0, 5.0),
-        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-        "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+        "n_estimators": trial.suggest_int("n_estimators", 100, 1500),
+        "max_depth": trial.suggest_int("max_depth", 2, 12),
+        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        "min_child_weight": trial.suggest_float("min_child_weight", 0.1, 300.0, log=True),
+        "subsample": trial.suggest_float("subsample", 0.4, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.2, 1.0),
+        "gamma": trial.suggest_float("gamma", 0.0, 20.0),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 100.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 100.0, log=True),
         "n_jobs": 4,
     }
 
@@ -123,13 +123,14 @@ def tune_xgboost(
     seed: int = 42,
     early_stopping_rounds: int | None = 50,
     early_stopping_min_delta: float = 0.01,
+    timeout: float | None = None,
     show_progress: bool = True,
 ) -> optuna.Study:
     """Search XGBoost hyperparameters on the workflow's preprocessed frames.
 
     The workflow must already hold numeric train, validation, and test frames
     (see ``generate_preprocessed_data``). Validation PR-AUC is maximized.
-    ``n_estimators`` is sampled from 50 to 500 and is the tree cap; early
+    ``n_estimators`` is sampled from 100 to 1500 and is the tree cap; early
     stopping can stop earlier. ``n_jobs`` is always 4. ``scale_pos_weight``
     is not searched.
 
@@ -149,6 +150,8 @@ def tune_xgboost(
         Patience on validation logloss. ``None`` trains for every tree.
     early_stopping_min_delta : float, default=0.01
         Minimum absolute logloss improvement versus the best validation score.
+    timeout : float or None, default=None
+        Stop the search after this many seconds even if trials remain.
     show_progress : bool, default=True
         Show the Optuna progress bar.
 
@@ -222,7 +225,12 @@ def tune_xgboost(
         sampler=optuna.samplers.TPESampler(seed=seed),
         study_name="xgboost_no_balancing",
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress)
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        timeout=timeout,
+        show_progress_bar=show_progress,
+    )
     log.info(
         "Optuna search finished. Best validation PR-AUC %.4f with %s.",
         study.best_value,

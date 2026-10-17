@@ -693,7 +693,6 @@ class ModelTrainingWorkflow():
             tree_method = hyperparameters.pop("tree_method", "hist")
             objective = hyperparameters.pop("objective", "binary:logistic")
             model_params = {
-                "use_label_encoder": False,
                 "objective": objective,
                 "seed": seed,
                 "n_jobs": -1,
