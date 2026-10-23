@@ -3,14 +3,10 @@
 # Standard library imports
 import logging
 import os
-import pickle  # nosec B403
-from datetime import datetime
-from pathlib import Path
 
 # Third party imports
 import mlflow
 import pandas as pd
-import yaml
 from catboost import CatBoostClassifier
 
 # First party imports
@@ -1038,7 +1034,7 @@ class ModelTrainingWorkflow():
         early_stopping_min_delta: float | None = None,
         best_iteration: int | None = None,
     ):
-        """Log params, metrics, figures, and the fitted model to the active MLflow run.
+        """Log params, metrics, and figures to the active MLflow run.
 
         Must be called inside an active MLflow run. Skips CatBoost
         ``cat_features`` in the param dict unless it is a non-None list, in
@@ -1079,7 +1075,6 @@ class ModelTrainingWorkflow():
             log_figures_to_mlflow,
             log_metrics_to_mlflow,
             log_params_to_mlflow,
-            save_model_into_mlflow,
         )
 
         params = {
@@ -1145,9 +1140,6 @@ class ModelTrainingWorkflow():
         log_figures_to_mlflow(figures, artifact_path="plots")
         log_params_to_mlflow({"top_n_features": len(top_features)})
         mlflow.log_table(top_features, artifact_file="feature_importance/top_features.json")
-
-        signature = infer_signature(x_train, self.model.predict_proba(x_train))
-        save_model_into_mlflow(self.model, flavor=model_type, signature=signature)
 
     def train_model(
         self,
@@ -1400,6 +1392,10 @@ class ModelTrainingWorkflow():
                     early_stopping_min_delta=self.early_stopping_min_delta,
                     best_iteration=best_iteration,
                 )
+                signature = infer_signature(
+                    x_train, self.model.predict_proba(x_train)
+                )
+                self.save_model(model_type=model_type, signature=signature)
             log.info(
                 f"Model training completed successfully using {model_type} (logged to MLflow)."
             )
@@ -1427,57 +1423,55 @@ class ModelTrainingWorkflow():
             "best_iteration": best_iteration,
         }
 
-    def save_model(self):
-        """Save configuration YAML and, if set, the MLflow model as a pickle.
+    def save_model(self, model_type: str, signature=None, artifact_path: str = "model"):
+        """Log the fitted model into the active MLflow run.
 
-        Writes a timestamped config file under ``self.config.model_output_path``.
-        If ``self.config.best_model_uri`` is set, loads that model with
-        ``mlflow.sklearn.load_model`` and pickles it next to the config.
+        ``train_model`` calls this while its MLflow run is open. The artifact
+        is stored at ``artifact_path`` using the XGBoost or CatBoost flavor.
+
+        Parameters
+        ----------
+        model_type : str
+            ``"xgboost"`` or ``"catboost"``. Selects the MLflow flavor.
+        signature : mlflow.models.ModelSignature, optional
+            Input and output signature logged with the model.
+        artifact_path : str, default="model"
+            Path of the model artifact inside the run.
 
         Returns
         -------
         None
-            Writes ``config_{timestamp}.yaml`` and, when a URI is present,
-            ``best_model_{timestamp}.pkl``.
 
-        Notes
-        -----
-        Requires ``self.config.model_output_path``. If ``best_model_uri`` is
-        missing, the config is still saved and the method returns without a
-        pickle. The output directory is created if it does not exist.
-
-        Examples
-        --------
-        >>> workflow.config.model_output_path = '/path/to/output'
-        >>> workflow.config.best_model_uri = 'runs:/abc123/model'
-        >>> workflow.save_model()
+        Raises
+        ------
+        ValueError
+            If no model has been fitted, or ``model_type`` is unsupported.
+        RuntimeError
+            If there is no active MLflow run.
         """
-        # this assumes loading from MLflow by a static run ID
-        # create output directory if it doesn't exist
-        log.info("Starting model saving process.")
-        timestamp = datetime.now().strftime("%Y%m%d_%H_%M_%S")
-        output_path = Path(self.config.model_output_path)
-        output_path.mkdir(parents=True, exist_ok=True)
-        # Save config YAML
-        config_path = output_path / f"config_{timestamp}.yaml"
-        config_dict = self.config.model_dump(by_alias=True, exclude_none=True)
-        with open(config_path, "w") as f:
-            yaml.dump(config_dict, f, default_flow_style=False)
-        log.info(f"Configuration saved at: {config_path}")
-        # Save the best model
-        best_model_uri = self.config.best_model_uri
-        if not best_model_uri:
-            log.info("Best model URI is not set in the configuration, skipping save.")
-            return  # Stop the save process if no model URI is provided
+        from src.model_training.ml_flow import save_model_into_mlflow
 
-        log.info(f"Loading best model from: {best_model_uri}")
-        model = mlflow.sklearn.load_model(best_model_uri)
+        if self.model is None:
+            raise ValueError("Model has not been trained. Call train_model() first.")
+        if model_type not in ("xgboost", "catboost"):
+            raise ValueError(
+                f"model_type must be 'xgboost' or 'catboost', got '{model_type}'"
+            )
+        if mlflow.active_run() is None:
+            raise RuntimeError(
+                "No active MLflow run found. Start a run before saving the model."
+            )
 
-        file_path = output_path / f"best_model_{timestamp}.pkl"
-        with open(file_path, "wb") as f:
-            pickle.dump(model, f)
-
-        log.info(f"Model saved at: {file_path}")
+        log.info(
+            f"Saving {model_type} model to the active MLflow run at '{artifact_path}'."
+        )
+        save_model_into_mlflow(
+            self.model,
+            flavor=model_type,
+            artifact_path=artifact_path,
+            signature=signature,
+        )
+        log.info("Model saved to the active MLflow run.")
 
     @staticmethod
     def evaluate_predictions(
